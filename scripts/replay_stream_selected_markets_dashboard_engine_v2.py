@@ -1022,6 +1022,62 @@ def _maker_under_lay_grid_q_ahead_for_runner_price(
     return float(st.get("q_ahead", st.get("q0_at_place", 0.0)) or 0.0)
 
 
+
+def _maker_under_lay_grid_runner_pnl(
+    runner: RunnerState,
+    market_id: str | None = None,
+) -> float | None:
+    """
+    Per-runner clean maker-grid PnL proxy.
+
+    Current maker grid is LAY-only:
+      matched stake is potential win if runner loses;
+      matched liability is current worst-case loss if runner wins.
+
+    For the current conservative dashboard PnL proxy we show:
+      pnl = - matched_liability
+    """
+    if not MAKER_UNDER_LAY_GRID_ENABLED:
+        return None
+
+    if not MAKER_UNDER_LAY_GRID_MATCHING_ENABLED:
+        return None
+
+    if market_id is None:
+        return None
+
+    target_market_id = str(market_id or "")
+    target_selection_id = int(runner.selection_id)
+    target_handicap = float(runner.handicap or 0.0)
+
+    matched_liability = 0.0
+
+    for okey, st in MAKER_UNDER_LAY_GRID_ORDER_STATE.items():
+        try:
+            omarket_id, selection_id, handicap, price = okey
+            if str(omarket_id) != target_market_id:
+                continue
+            if int(selection_id) != target_selection_id:
+                continue
+            if float(handicap) != target_handicap:
+                continue
+
+            matched = float(st.get("matched", 0.0) or 0.0)
+            price_f = float(price)
+        except Exception:
+            continue
+
+        if matched <= 0:
+            continue
+
+        matched_liability += matched * max(0.0, price_f - 1.0)
+
+    if matched_liability <= 0:
+        return 0.0
+
+    return -matched_liability
+
+
 def render_runner_ladder(
     runner: RunnerState,
     *,
@@ -1053,7 +1109,18 @@ def render_runner_ladder(
         window = ladder_window(center, ticks_above, ticks_below)
     window = _truncate_prices_around_center(window, center_price=center, max_rows=max_rows)
     out: list[str] = []
-    out.append(f"{fmt_text(runner.name or str(runner.selection_id), 22)}  center={center_mode}:{center:.2f}  ltp={runner.ltp or '-'}")
+    maker_runner_pnl = _maker_under_lay_grid_runner_pnl(runner, market_id=market_id)
+    maker_runner_pnl_txt = ""
+    if maker_runner_pnl is not None:
+        maker_runner_pnl_txt = f"PNL {maker_runner_pnl:+.2f}"
+
+    runner_name_txt = fmt_text(runner.name or str(runner.selection_id), 18)
+    if maker_runner_pnl_txt:
+        out.append(f"{runner_name_txt}  {maker_runner_pnl_txt}")
+    else:
+        out.append(f"{runner_name_txt}")
+
+    out.append(f"center={center_mode}:{center:.2f} ltp={runner.ltp or '-'}")
     # Fairbot-like ladder:
     # MY_LAY (maker) | MKT_BACK | PRICE | MKT_LAY | MY_BACK (maker) | MY_MATCHED
     myw = max(0, int(my_col_width))
