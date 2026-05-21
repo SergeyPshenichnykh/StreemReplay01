@@ -277,6 +277,7 @@ def _parse_keys(raw: str) -> list[str]:
 def _stable_stream(cmd: list[str], page: str) -> int:
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
+    env["STREEM_STABLE_WRAPPER"] = "1"
 
     _term_size = shutil.get_terminal_size(fallback=(260, 70))
     env["COLUMNS"] = str(_term_size.columns)
@@ -443,7 +444,14 @@ def _stable_stream(cmd: list[str], page: str) -> int:
                         raw_line, buf = buf.split("\n", 1)
                         line = raw_line.rstrip("\r")
 
-                        if line.startswith("BALANCE:") and frame:
+                        if _strip_ansi(line).strip() == "__STREEM_FRAME_END__":
+                            if frame:
+                                last_frame = frame
+                                _paint_frame(last_frame, current_page, paused, scroll=scroll)
+                                frame = []
+                            continue
+
+                        if _strip_ansi(line).startswith("BALANCE:") and frame:
                             last_frame = frame
                             if not paused:
                                 _paint_frame(last_frame, current_page, paused, scroll=scroll)

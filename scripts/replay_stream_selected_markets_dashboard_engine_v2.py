@@ -3223,6 +3223,12 @@ def _apply_maker_under_lay_grid_orders(
                     )
 
 
+def _emit_stable_frame_end() -> None:
+    if os.environ.get("STREEM_STABLE_WRAPPER") == "1":
+        print("__STREEM_FRAME_END__", flush=True)
+
+
+
 def stream_replay(args: argparse.Namespace) -> int:
     if not args.replay_file.exists():
         print(f"File not found: {args.replay_file}")
@@ -3652,6 +3658,7 @@ def stream_replay(args: argparse.Namespace) -> int:
                             err=interactive_err,
                             key=last_key,
                         )
+	                        _emit_stable_frame_end()
 
                     # Save snapshot for backward stepping (only when not browsing history).
                     if interactive:
@@ -3779,6 +3786,7 @@ def stream_replay(args: argparse.Namespace) -> int:
                                     err=interactive_err,
                                     key=last_key,
                                 )
+                                _emit_stable_frame_end()
                             except Exception as exc:
                                 interactive_err = f"{type(exc).__name__}: {exc}"
                                 # Don't crash the replay; keep paused so the user can continue.
