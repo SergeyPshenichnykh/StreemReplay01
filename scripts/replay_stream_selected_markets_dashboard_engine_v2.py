@@ -1078,6 +1078,76 @@ def _maker_under_lay_grid_runner_pnl(
     return -matched_liability
 
 
+
+def _maker_under_lay_grid_runner_exposure(
+    runner: RunnerState,
+    market_id: str | None = None,
+) -> dict[str, float] | None:
+    """
+    Matched maker-grid exposure for one runner.
+
+    Current model is LAY-only:
+      stake     = total matched LAY stake
+      liability = total matched LAY liability = sum(stake * (price - 1))
+
+    If this Under runner wins:
+      risk = -liability
+
+    If this Under runner loses:
+      win = +stake
+    """
+    if not MAKER_UNDER_LAY_GRID_ENABLED:
+        return None
+
+    if not MAKER_UNDER_LAY_GRID_MATCHING_ENABLED:
+        return None
+
+    if market_id is None:
+        return None
+
+    target_market_id = str(market_id or "")
+    target_selection_id = int(runner.selection_id)
+    target_handicap = float(runner.handicap or 0.0)
+
+    matched_stake_total = 0.0
+    matched_liability_total = 0.0
+
+    for okey, st in MAKER_UNDER_LAY_GRID_ORDER_STATE.items():
+        try:
+            omarket_id, selection_id, handicap, price = okey
+
+            if str(omarket_id) != target_market_id:
+                continue
+            if int(selection_id) != target_selection_id:
+                continue
+            if float(handicap) != target_handicap:
+                continue
+
+            matched = float(st.get("matched", 0.0) or 0.0)
+            price_f = float(price)
+        except Exception:
+            continue
+
+        if matched <= 0:
+            continue
+
+        matched_stake_total += matched
+        matched_liability_total += matched * max(0.0, price_f - 1.0)
+
+    if matched_stake_total <= 0:
+        return None
+
+    avg_lay_price = 1.0 + matched_liability_total / matched_stake_total
+
+    return {
+        "stake": matched_stake_total,
+        "liability": matched_liability_total,
+        "avg_lay_price": avg_lay_price,
+        "risk": -matched_liability_total,
+        "win": matched_stake_total,
+    }
+
+
 def render_runner_ladder(
     runner: RunnerState,
     *,
@@ -1109,14 +1179,13 @@ def render_runner_ladder(
         window = ladder_window(center, ticks_above, ticks_below)
     window = _truncate_prices_around_center(window, center_price=center, max_rows=max_rows)
     out: list[str] = []
-    maker_runner_pnl = _maker_under_lay_grid_runner_pnl(runner, market_id=market_id)
-    maker_runner_pnl_txt = ""
-    if maker_runner_pnl is not None:
-        maker_runner_pnl_txt = f"PNL {maker_runner_pnl:+.2f}"
+    maker_runner_exposure = _maker_under_lay_grid_runner_exposure(runner, market_id=market_id)
 
     runner_name_txt = fmt_text(runner.name or str(runner.selection_id), 18)
-    if maker_runner_pnl_txt:
-        out.append(f"{runner_name_txt}  {maker_runner_pnl_txt}")
+    if maker_runner_exposure is not None:
+        runner_risk = float(maker_runner_exposure.get("risk", 0.0) or 0.0)
+        runner_win = float(maker_runner_exposure.get("win", 0.0) or 0.0)
+        out.append(f"{runner_name_txt}  R {runner_risk:+.2f} W {runner_win:+.2f}")
     else:
         out.append(f"{runner_name_txt}")
 
@@ -1312,7 +1381,7 @@ def render_runner_ladder(
                 )
         else:
             out.append(f"{col_l_txt:>6}│{p_txt}│{col_b_txt:>6}")
-        if max_rows > 0 and (len(out) - 2) >= max_rows:
+        if max_rows > 0 and (len(out) - 3) >= max_rows:
             # rows beyond header lines are capped
             break
     return out
@@ -3296,9 +3365,201 @@ def _emit_stable_frame_end() -> None:
 
 
 
+
+
+def _maker_under_lay_grid_canonical_totals_market_ids(
+    markets: dict[str, MarketState] | None = None,
+) -> set[str]:
+    """
+    Canonical visible totals market ids used for maker-grid portfolio stats.
+
+    Sticky totals UI shows one canonical Over/Under market per line.
+    This helper mirrors that idea:
+      - only Over/Under Goals markets
+      - only Under *.5 lines from 0.5 to 8.5
+      - first market id per line in sorted order
+    """
+    if not markets:
+        return set()
+
+    by_line: dict[float, str] = {}
+
+    for mid in sorted(markets.keys()):
+        st = markets.get(mid)
+        if st is None:
+            continue
+        if not is_over_under_goals(st):
+            continue
+
+        line = over_under_line(st)
+        if line is None:
+            continue
+
+        line_f = float(line)
+        if line_f < 0.5 or line_f > 8.5:
+            continue
+
+        # Keep only x.5 totals lines.
+        if abs((line_f % 1.0) - 0.5) > 1e-9:
+            continue
+
+        under_runner_exists = any(
+            _maker_grid_is_under_runner(r)
+            for r in st.runners.values()
+        )
+        if not under_runner_exists:
+            continue
+
+        by_line.setdefault(line_f, str(st.market_id or mid))
+
+    return set(by_line.values())
+
+
+def _maker_under_lay_grid_visible_totals_exposure(
+    markets: dict[str, MarketState] | None = None,
+) -> dict[str, float]:
+    """
+    Maker-grid exposure restricted to canonical visible totals markets.
+
+    This keeps:
+      runner R/W
+      ENGINE_V2 overlay
+      OUTCOME line
+    on the same source set.
+    """
+    visible_market_ids = _maker_under_lay_grid_canonical_totals_market_ids(markets)
+
+    matched_stake_total = 0.0
+    matched_liability_total = 0.0
+    open_liability_total = 0.0
+    active_orders = 0.0
+
+    if not visible_market_ids:
+        return {
+            "matched_stake": 0.0,
+            "matched_liability": 0.0,
+            "open_liability": 0.0,
+            "active_orders": 0.0,
+        }
+
+    for okey, st in MAKER_UNDER_LAY_GRID_ORDER_STATE.items():
+        try:
+            market_id, _selection_id, _handicap, price = okey
+            if str(market_id) not in visible_market_ids:
+                continue
+
+            price_f = float(price)
+            matched = float(st.get("matched", 0.0) or 0.0)
+            remaining = float(st.get("remaining", 0.0) or 0.0)
+        except Exception:
+            continue
+
+        if matched > 0:
+            matched_stake_total += matched
+            matched_liability_total += matched * max(0.0, price_f - 1.0)
+
+        if remaining > 0:
+            active_orders += 1.0
+            open_liability_total += remaining * max(0.0, price_f - 1.0)
+
+    return {
+        "matched_stake": matched_stake_total,
+        "matched_liability": matched_liability_total,
+        "open_liability": open_liability_total,
+        "active_orders": active_orders,
+    }
+
+
+
+def _maker_under_lay_grid_outcome_pnls(
+    markets: dict[str, MarketState] | None = None,
+    max_goals: int = 9,
+) -> dict[int, float]:
+    """
+    Portfolio outcome PnL by final total goals.
+
+    Current strategy is LAY-only on Under *.5 Goals.
+
+    For each matched LAY:
+      if final_goals < line: Under wins, our LAY loses liability
+      if final_goals >= line: Under loses, our LAY wins stake
+
+    Uses only canonical visible totals markets, so OUTCOME matches visible R/W.
+    """
+    if not MAKER_UNDER_LAY_GRID_ENABLED:
+        return {}
+
+    if not MAKER_UNDER_LAY_GRID_MATCHING_ENABLED:
+        return {}
+
+    markets = markets or {}
+    visible_market_ids = _maker_under_lay_grid_canonical_totals_market_ids(markets)
+    if not visible_market_ids:
+        return {}
+
+    out = {g: 0.0 for g in range(int(max_goals) + 1)}
+    has_matched = False
+
+    for okey, st in MAKER_UNDER_LAY_GRID_ORDER_STATE.items():
+        try:
+            market_id, _selection_id, _handicap, price = okey
+            market_id_s = str(market_id)
+
+            if market_id_s not in visible_market_ids:
+                continue
+
+            market_state = markets.get(market_id_s)
+            if market_state is None:
+                continue
+
+            line = over_under_line(market_state)
+            if line is None:
+                continue
+
+            line_f = float(line)
+            price_f = float(price)
+            matched = float(st.get("matched", 0.0) or 0.0)
+        except Exception:
+            continue
+
+        if matched <= 0:
+            continue
+
+        has_matched = True
+        liability = matched * max(0.0, price_f - 1.0)
+
+        for goals in out:
+            if float(goals) < line_f:
+                out[goals] -= liability
+            else:
+                out[goals] += matched
+
+    return out if has_matched else {}
+
+def _maker_under_lay_grid_outcome_line(outcome_pnls: dict[int, float]) -> str:
+    if not outcome_pnls:
+        return ""
+
+    max_goals = max(outcome_pnls)
+    worst = min(outcome_pnls.values())
+    best = max(outcome_pnls.values())
+
+    parts = []
+    for goals in sorted(outcome_pnls):
+        label = f"G{goals}" if goals < max_goals else f"G{goals}+"
+        parts.append(f"{label}={outcome_pnls[goals]:+.2f}")
+
+    return (
+        f"OUTCOME: worst={worst:+.2f} best={best:+.2f} "
+        + " ".join(parts)
+    )
+
+
+
 def _set_clean_maker_overlay_before_render(
     balance: float | None,
     enabled: bool,
+    markets: dict[str, MarketState] | None = None,
 ) -> None:
     global ENGINE_V2_OVERLAY_LINE
     global ENGINE_V2_TAPE_LINE
@@ -3314,41 +3575,32 @@ def _set_clean_maker_overlay_before_render(
 
     base_balance = float(balance or 0.0)
 
-    matched_stake_total = 0.0
-    matched_liability_total = 0.0
+    exposure = _maker_under_lay_grid_visible_totals_exposure(markets)
 
-    for okey, st in MAKER_UNDER_LAY_GRID_ORDER_STATE.items():
-        try:
-            price = float(okey[3])
-            matched = float(st.get("matched", 0.0) or 0.0)
-        except Exception:
-            continue
+    matched_stake_total = float(exposure.get("matched_stake", 0.0) or 0.0)
+    matched_liability_total = float(exposure.get("matched_liability", 0.0) or 0.0)
+    open_liability = float(exposure.get("open_liability", 0.0) or 0.0)
+    active_orders = int(float(exposure.get("active_orders", 0.0) or 0.0))
 
-        if matched <= 0:
-            continue
-
-        matched_stake_total += matched
-        matched_liability_total += matched * max(0.0, price - 1.0)
-
-    open_liability = float(MAKER_UNDER_LAY_GRID_LIABILITY_TOTAL)
     locked = open_liability + matched_liability_total
     free = base_balance - locked
-    pnl_proxy = -matched_liability_total
+
+    outcome_pnls = _maker_under_lay_grid_outcome_pnls(markets)
+    pnl_proxy = min(outcome_pnls.values()) if outcome_pnls else -matched_liability_total
 
     ENGINE_V2_OVERLAY_LINE = (
         f"ENGINE_V2: active=0 next10s=0 "
         f"locked={locked:.2f} "
         f"free={free:.2f} "
         f"pnl_proxy={pnl_proxy:.4f} NEXT=-"
-        f" maker_grid_active={MAKER_UNDER_LAY_GRID_ACTIVE_ORDERS}"
+        f" maker_grid_active={active_orders}"
         + (" maker_matching=ON" if MAKER_UNDER_LAY_GRID_MATCHING_ENABLED else " maker_matching=OFF")
         + f" maker_matched={matched_stake_total:.2f}"
         + f" maker_matched_liability={matched_liability_total:.2f}"
         + f" maker_liability={open_liability:.2f}"
     )
-    ENGINE_V2_TAPE_LINE = ""
 
-
+    ENGINE_V2_TAPE_LINE = _maker_under_lay_grid_outcome_line(outcome_pnls)
 
 def stream_replay(args: argparse.Namespace) -> int:
     if not args.replay_file.exists():
@@ -3734,7 +3986,7 @@ def stream_replay(args: argparse.Namespace) -> int:
                         )
                         print(json.dumps(payload, ensure_ascii=False))
                     else:
-	                        _set_clean_maker_overlay_before_render(balance, bool(getattr(args, "engine_v2_overlay", False)))
+	                        _set_clean_maker_overlay_before_render(balance, bool(getattr(args, "engine_v2_overlay", False)), markets=markets)
 	                        render_dashboard(
 	                            pt=next_frame_pt,
 	                            markets=markets,
@@ -3863,7 +4115,7 @@ def stream_replay(args: argparse.Namespace) -> int:
                                 hist_i = idx
                                 _rebuild_maker_grid_to_history_index(hist_i)
                                 interactive_err = None
-                                _set_clean_maker_overlay_before_render(balance, bool(getattr(args, "engine_v2_overlay", False)))
+                                _set_clean_maker_overlay_before_render(balance, bool(getattr(args, "engine_v2_overlay", False)), markets=markets)
                                 render_dashboard(
                                     pt=int(s.frame_pt),
                                     markets=markets,
