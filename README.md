@@ -2,18 +2,54 @@
 
 Betfair replay dashboard / strategy research project.
 
+## Repository state
+
+Current fixed stable code state:
+
+```text
+repo:   https://github.com/SergeyPshenichnykh/StreemReplay01.git
+branch: main
+commit: c9f9a18
+mode:   stable interactive replay dashboard
+```
+
+Base full snapshot tag:
+
+```text
+v0.1-full-snapshot
+```
+
+Current latest commit:
+
+```text
+c9f9a18 Fix stable interactive seek and compact full ladder columns
+```
+
 ## Current stable interactive mode
 
 Current working mode:
 
 - stable terminal stream
 - interactive page switching
+- vertical scroll
+- replay forward/back seek
 - Under totals ladders
 - Correct Score ladders
-- queue columns
+- full ladder queue columns
 - Engine V2 overlay
 - orders / fills / PnL page
 - replay sample: `replay/football-pro-sample`
+
+The current stable workflow uses:
+
+```text
+--stable-stream
+--interactive
+--list-totals-ladder
+--totals-sticky
+--engine-v2-overlay
+--show-queue
+```
 
 ## Main interactive launch command
 
@@ -38,7 +74,7 @@ python scripts/replay_stream_selected_markets_dashboard_sticky_totals_engine_v2.
   --ticks-above 15 \
   --ticks-below 15 \
   --col-width 999 \
-  --cs-cols 5 \
+  --cs-cols 3 \
   --cadence-ms 1000 \
   --delay 0.02 \
   --balance 1000 \
@@ -50,22 +86,42 @@ python scripts/replay_stream_selected_markets_dashboard_sticky_totals_engine_v2.
 ## Interactive keys
 
 ```text
-1      totals page: Under 0.5–8.5
-2      correct_score page: Correct Score ladders
-3      orders page: active orders / fills / PnL
-a      all pages
-space  pause / resume
-q      quit
+1          totals page
+2          correct_score page
+3          orders page
+a          all pages
+
+j          vertical scroll down
+k          vertical scroll up
+PageDown   fast vertical scroll down
+PageUp     fast vertical scroll up
+Home / g   top
+End        bottom
+
+space      pause / resume
+f          forward by 1 replay frame
+b          back by 1 replay frame
+q          quit
 ```
 
-## Stable page layout
+Important:
+
+```text
+Engine native forward key is n.
+Stable wrapper exposes forward as f.
+Stable wrapper exposes back as b.
+```
+
+## Current layout
 
 ### Totals page
 
 ```text
-5 columns
+3 columns per visual row
 30 ladder rows
-queue columns enabled with --show-queue
+Under 0.5 through Under 8.5
+full ladder fields visible:
+MYL / Q0 / Q1 / L / P / B / MYB / VOL / MAT
 ```
 
 Markets:
@@ -85,14 +141,17 @@ Under 8.5
 ### Correct Score page
 
 ```text
-5 columns
+3 columns per visual row
 20 ladder rows
-queue columns enabled with --show-queue
+full ladder fields visible:
+MYL / Q0 / Q1 / L / P / B / MYB / VOL / MAT
 ```
 
 ### Orders page
 
-Shows Engine V2 / active orders / fills / PnL related lines.
+```text
+Engine V2 / active orders / fills / PnL status
+```
 
 ## Notes
 
@@ -112,32 +171,33 @@ Do not use `--smooth-ui` for this workflow. Use:
 --stable-stream
 ```
 
-## Safety archive
+## Restore from GitHub clone
 
-Before creating this repository, a full project archive was created from the original working project.
-
-Recommended archive command:
+After cloning the repository, restore oversized files first:
 
 ```bash
 cd ~/projects
 
-STAMP=$(date +%Y%m%d_%H%M%S)
+git clone https://github.com/SergeyPshenichnykh/StreemReplay01.git
 
-tar -czf "streem_replay_ABSOLUTE_FULL_FINAL_${STAMP}.tar.gz" streem_replay
+cd StreemReplay01
 
-cp "streem_replay_ABSOLUTE_FULL_FINAL_${STAMP}.tar.gz" /mnt/c/Users/sergp/Downloads/
+./restore_oversize_files.sh
 ```
 
-Expected archive location:
+This reconstructs oversized files from split parts and verifies SHA256.
+
+Expected restored files include:
 
 ```text
-~/projects/streem_replay_ABSOLUTE_FULL_FINAL_YYYYMMDD_HHMMSS.tar.gz
-C:\Users\sergp\Downloads\streem_replay_ABSOLUTE_FULL_FINAL_YYYYMMDD_HHMMSS.tar.gz
+_archives/streem_replay_ABSOLUTE_FULL_FINAL_20260521_030447.tar.gz
+replay/delta_10s/action_log.csv
+replay/delta_10s/price_level_delta.csv
 ```
 
-## Oversized files restore
+## Oversized files
 
-GitHub blocks normal git files larger than 100MB, and Git LFS is not available for this account because the LFS budget is exceeded.
+GitHub blocks normal git files larger than 100MB, and Git LFS is not available for this account because the LFS budget was exceeded.
 
 Therefore files larger than 100MB are stored as split parts in:
 
@@ -152,4 +212,58 @@ cd StreemReplay01
 ./restore_oversize_files.sh
 ```
 
-This reconstructs the original oversized files and verifies SHA256.
+The restore script reconstructs the original oversized files and verifies SHA256.
+
+## Safety archive
+
+A full project archive was created from the original working project.
+
+Archive location in the project after restore:
+
+```text
+_archives/streem_replay_ABSOLUTE_FULL_FINAL_20260521_030447.tar.gz
+```
+
+A copy was also placed in Windows Downloads when the archive was created:
+
+```text
+C:\Users\sergp\Downloads\streem_replay_ABSOLUTE_FULL_FINAL_20260521_030447.tar.gz
+```
+
+Recommended archive command for future full backups:
+
+```bash
+cd ~/projects
+
+STAMP=$(date +%Y%m%d_%H%M%S)
+
+tar -czf "streem_replay_ABSOLUTE_FULL_FINAL_${STAMP}.tar.gz" StreemReplay01
+
+cp "streem_replay_ABSOLUTE_FULL_FINAL_${STAMP}.tar.gz" /mnt/c/Users/sergp/Downloads/
+```
+
+## Validation commands
+
+Check syntax:
+
+```bash
+cd ~/projects/StreemReplay01
+
+python -m py_compile \
+  scripts/replay_stream_selected_markets_dashboard_engine_v2.py \
+  scripts/replay_stream_selected_markets_dashboard_stationary_totals_engine_v2.py \
+  scripts/replay_stream_selected_markets_dashboard_sticky_totals_engine_v2.py
+```
+
+Check git state:
+
+```bash
+git status
+git log --oneline -5
+```
+
+Expected clean state:
+
+```text
+nothing to commit, working tree clean
+```
