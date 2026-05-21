@@ -53,6 +53,13 @@ from replay_stream_selected_markets_features import (
 
 SIMULATE_ORDERS_ENABLED = False
 MAKER_UNDER_LAY_GRID_ENABLED = False
+MAKER_UNDER_LAY_GRID_MATCHING_ENABLED = False
+MAKER_UNDER_LAY_GRID_MATCHED_TOTAL = 0.0
+MAKER_UNDER_LAY_GRID_LIABILITY_TOTAL = 0.0
+MAKER_UNDER_LAY_GRID_LAST_PT: int | None = None
+MAKER_UNDER_LAY_GRID_APPLY_INDEX = 0
+MAKER_UNDER_LAY_GRID_ORDER_STATE: dict[tuple[str, int, float, float], dict[str, float | str]] = {}
+MAKER_UNDER_LAY_GRID_PLACED_RUNNERS: set[tuple[str, int, float]] = set()
 MAKER_UNDER_LAY_GRID_ACTIVE_ORDERS = 0
 
 MAKER_UNDER_LAY_GRID_STAKES: dict[float, float] = {
@@ -635,6 +642,11 @@ def parse_args() -> argparse.Namespace:
         help="Show adaptive maker LAY grid on Under *.5 Goals from current price/1.25 down to 1.01. No matching simulation.",
     )
     p.add_argument(
+        "--maker-under-lay-grid-match",
+        action="store_true",
+        help="Enable FIFO matching simulation for one-time maker Under LAY grid.",
+    )
+    p.add_argument(
         "--simulate-orders",
         action="store_true",
         help="Enable legacy synthetic order execution/matching simulation. Default OFF for clean-sheet strategy work.",
@@ -882,7 +894,39 @@ def _maker_grid_best_lay_for_runner(runner: RunnerState) -> float | None:
     return None
 
 
-def _maker_under_lay_grid_stake_for_runner_price(runner: RunnerState, price: float) -> float | None:
+def _maker_grid_runner_key(
+    market_id: str | None,
+    runner: RunnerState,
+) -> tuple[str, int, float]:
+    return (
+        str(market_id or ""),
+        int(runner.selection_id),
+        float(runner.handicap or 0.0),
+    )
+
+
+def _maker_grid_order_key(
+    market_id: str | None,
+    runner: RunnerState,
+    price: float,
+) -> tuple[str, int, float, float]:
+    return (
+        str(market_id or ""),
+        int(runner.selection_id),
+        float(runner.handicap or 0.0),
+        round(float(price), 2),
+    )
+
+
+def _maker_grid_visual_l_qty_for_runner_price(runner: RunnerState, price: float) -> float:
+    # In this dashboard, visual L column = runner.available_to_back.
+    try:
+        return float(runner.available_to_back.get(round(float(price), 2)) or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _maker_grid_base_stake_for_runner_price(runner: RunnerState, price: float) -> float | None:
     if not MAKER_UNDER_LAY_GRID_ENABLED:
         return None
 
@@ -894,18 +938,89 @@ def _maker_under_lay_grid_stake_for_runner_price(runner: RunnerState, price: flo
     if price < 1.01 or price > 1.25:
         return None
 
-    best_lay = _maker_grid_best_lay_for_runner(runner)
-    if best_lay is None:
+    start_l = _maker_grid_best_lay_for_runner(runner)
+    if start_l is None:
         return None
 
-    start_price = min(1.25, max(1.01, round(float(best_lay), 2)))
+    start_price = min(1.25, max(1.01, round(float(start_l), 2)))
 
-    # If current market is below 1.25, grid starts from current price.
-    # If current market is >= 1.25, full grid starts from 1.25.
     if price > start_price:
         return None
 
     return MAKER_UNDER_LAY_GRID_STAKES.get(price)
+
+
+def _maker_under_lay_grid_stake_for_runner_price(
+    runner: RunnerState,
+    price: float,
+    market_id: str | None = None,
+) -> float | None:
+    if market_id is not None:
+        okey = _maker_grid_order_key(market_id, runner, price)
+        st = MAKER_UNDER_LAY_GRID_ORDER_STATE.get(okey)
+
+        if st is not None:
+            remaining = float(st.get("remaining", st.get("stake", 0.0)) or 0.0)
+            return remaining if remaining > 0 else None
+
+        rkey = _maker_grid_runner_key(market_id, runner)
+        if rkey in MAKER_UNDER_LAY_GRID_PLACED_RUNNERS:
+            return None
+
+    return _maker_grid_base_stake_for_runner_price(runner, price)
+
+
+def _maker_under_lay_grid_matched_for_runner_price(
+    runner: RunnerState,
+    price: float,
+    market_id: str | None = None,
+) -> float | None:
+    """
+    Display MAT for our LAY order as liability/cost.
+
+    For BACK:
+        cost = matched_stake
+
+    For LAY:
+        liability/cost = matched_stake * (price - 1)
+
+    The internal matched value remains matched stake.
+    The visible MAT column for this maker LAY grid shows LAY liability.
+    """
+    if market_id is None:
+        return None
+
+    price = round(float(price), 2)
+    okey = _maker_grid_order_key(market_id, runner, price)
+    st = MAKER_UNDER_LAY_GRID_ORDER_STATE.get(okey)
+
+    if st is None:
+        return None
+
+    matched_stake = float(st.get("matched", 0.0) or 0.0)
+    if matched_stake <= 0:
+        return None
+
+    lay_liability = matched_stake * max(0.0, price - 1.0)
+    return lay_liability if lay_liability > 0 else None
+
+
+def _maker_under_lay_grid_q_ahead_for_runner_price(
+    runner: RunnerState,
+    price: float,
+    market_id: str | None = None,
+) -> float | None:
+    if market_id is None:
+        return None
+
+    okey = _maker_grid_order_key(market_id, runner, price)
+    st = MAKER_UNDER_LAY_GRID_ORDER_STATE.get(okey)
+
+    if st is None:
+        return None
+
+    return float(st.get("q_ahead", st.get("q0_at_place", 0.0)) or 0.0)
+
 
 def render_runner_ladder(
     runner: RunnerState,
@@ -1025,7 +1140,7 @@ def render_runner_ladder(
                 _clean_restore_order_display = True
                 _clean_my_lay_val = float(getattr(my, "my_lay", 0.0) or 0.0)
                 _clean_my_back_val = float(getattr(my, "my_back", 0.0) or 0.0)
-            maker_grid_lay_val = _maker_under_lay_grid_stake_for_runner_price(runner, float(price))
+            maker_grid_lay_val = _maker_under_lay_grid_stake_for_runner_price(runner, float(price), market_id=market_id)
             if maker_grid_lay_val is not None:
                 # Maker LAY grid on Under totals.
                 # Display our order size in MYL.
@@ -1097,10 +1212,22 @@ def render_runner_ladder(
 
 
 
+            maker_grid_matched_val = _maker_under_lay_grid_matched_for_runner_price(runner, float(price), market_id=market_id)
+            if maker_grid_matched_val is not None and maker_grid_matched_val > 0:
+                my_mat_val = maker_grid_matched_val
+
             my_lay_txt = _c(_fmt_sz(my_lay_val, width=myw), "100;97")
             my_back_txt = _c(_fmt_sz(my_back_val, width=myw), "100;97")
             if show_queue and my_lay_val is not None and my_lay_val > 0:
-                q_before = 0.0 if bsz is None else float(bsz)
+                maker_grid_q0_val = _maker_under_lay_grid_q_ahead_for_runner_price(
+                    runner,
+                    float(price),
+                    market_id=market_id,
+                )
+                if maker_grid_q0_val is not None:
+                    q_before = float(maker_grid_q0_val)
+                else:
+                    q_before = 0.0 if bsz is None else float(bsz)
                 q_after = q_before + float(my_lay_val)
                 q0_txt = _c(_fmt_sz(q_before, width=6), "90")
                 q1_txt = _c(_fmt_sz(q_after, width=6), "90")
@@ -2922,26 +3049,44 @@ def _apply_maker_under_lay_grid_orders(
     *,
     markets: dict[str, MarketState],
     order_model: OrderModel,
+    pt: int | None = None,
+    frame_no: int | None = None,
 ) -> None:
     """
-    Populate order_model with OPEN maker LAY grid orders.
+    One-time stationary maker Under LAY grid + FIFO matching.
 
-    This is placement/state only:
-    - creates MYL values;
-    - does not create MYB;
-    - does not write MAT;
-    - does not perform matching.
+    Matching rules for MYL LAY orders:
+    - FRAME 1 cannot have matching;
+    - order cannot match on the same frame where it was placed;
+    - visual L column = runner.available_to_back;
+    - q_ahead is consumed by L-volume decreases before our order;
+    - our order can match ONLY when best visual L price has reached/crossed order price:
+        best_visual_l_price <= order_price
+    - lower prices cannot match while higher grid prices for same runner remain open.
     """
     global MAKER_UNDER_LAY_GRID_ACTIVE_ORDERS
+    global MAKER_UNDER_LAY_GRID_MATCHED_TOTAL
+    global MAKER_UNDER_LAY_GRID_LIABILITY_TOTAL
+    global MAKER_UNDER_LAY_GRID_LAST_PT
+
     MAKER_UNDER_LAY_GRID_ACTIVE_ORDERS = 0
+    MAKER_UNDER_LAY_GRID_MATCHED_TOTAL = 0.0
+    MAKER_UNDER_LAY_GRID_LIABILITY_TOTAL = 0.0
+
+    order_model.by_key.clear()
 
     if not MAKER_UNDER_LAY_GRID_ENABLED:
         return
 
-    # Clean-sheet grid state for now.
-    # Later, when matching/cancel/edit logic is implemented, this will become
-    # a persistent OrderState registry instead of full refresh.
-    order_model.by_key.clear()
+    frame_i = int(frame_no or 0)
+
+    if pt is not None:
+        if MAKER_UNDER_LAY_GRID_LAST_PT is not None and int(pt) < int(MAKER_UNDER_LAY_GRID_LAST_PT):
+            MAKER_UNDER_LAY_GRID_ORDER_STATE.clear()
+            MAKER_UNDER_LAY_GRID_PLACED_RUNNERS.clear()
+        MAKER_UNDER_LAY_GRID_LAST_PT = int(pt)
+
+    placed_now_keys: set[tuple[str, int, float, float]] = set()
 
     for state in markets.values():
         if not is_over_under_goals(state):
@@ -2951,25 +3096,131 @@ def _apply_maker_under_lay_grid_orders(
             if not _maker_grid_is_under_runner(runner):
                 continue
 
-            for price, stake in sorted(MAKER_UNDER_LAY_GRID_STAKES.items(), reverse=True):
-                grid_stake = _maker_under_lay_grid_stake_for_runner_price(runner, float(price))
-                if grid_stake is None:
+            rkey = _maker_grid_runner_key(str(state.market_id), runner)
+
+            # One-time placement only.
+            if rkey not in MAKER_UNDER_LAY_GRID_PLACED_RUNNERS:
+                start_l = _maker_grid_best_lay_for_runner(runner)
+                if start_l is None:
                     continue
 
-                key = (
-                    str(state.market_id),
-                    int(runner.selection_id),
-                    runner.handicap,
-                    float(price),
+                start_price = min(1.25, max(1.01, round(float(start_l), 2)))
+                placed_any = False
+
+                for price, stake in sorted(MAKER_UNDER_LAY_GRID_STAKES.items(), reverse=True):
+                    price = round(float(price), 2)
+
+                    if price > start_price:
+                        continue
+
+                    okey = _maker_grid_order_key(str(state.market_id), runner, price)
+                    q0 = _maker_grid_visual_l_qty_for_runner_price(runner, price)
+
+                    MAKER_UNDER_LAY_GRID_ORDER_STATE[okey] = {
+                        "price": float(price),
+                        "stake": float(stake),
+                        "remaining": float(stake),
+                        "matched": 0.0,
+                        "q0_at_place": float(q0),
+                        "q_ahead": float(q0),
+                        "prev_l_qty": float(q0),
+                        "current_l_qty": float(q0),
+                        "placed_pt": int(pt) if pt is not None else -1,
+                        "placed_frame": float(frame_i),
+                        "status": "OPEN",
+                    }
+
+                    placed_now_keys.add(okey)
+                    placed_any = True
+
+                if placed_any:
+                    MAKER_UNDER_LAY_GRID_PLACED_RUNNERS.add(rkey)
+
+            visual_l_prices = [
+                float(px)
+                for px, qty in runner.available_to_back.items()
+                if qty is not None and float(qty) > 0
+            ]
+            best_visual_l_price = max(visual_l_prices) if visual_l_prices else None
+
+            runner_orders = [
+                (okey, st)
+                for okey, st in MAKER_UNDER_LAY_GRID_ORDER_STATE.items()
+                if okey[0] == str(state.market_id)
+                and int(okey[1]) == int(runner.selection_id)
+                and float(okey[2]) == float(runner.handicap or 0.0)
+            ]
+            runner_orders.sort(key=lambda item: float(item[0][3]), reverse=True)
+
+            for okey, st in runner_orders:
+                _market_id, _selection_id, _handicap, price = okey
+                price = float(price)
+
+                current_l_qty = _maker_grid_visual_l_qty_for_runner_price(runner, price)
+                prev_l_qty = float(st.get("prev_l_qty", st.get("current_l_qty", current_l_qty)) or 0.0)
+
+                placed_frame = int(float(st.get("placed_frame", frame_i) or frame_i))
+
+                decrease = max(0.0, prev_l_qty - current_l_qty)
+
+                # Queue ahead can shrink before price is reached, but that is NOT a fill.
+                if decrease > 0:
+                    q_ahead = float(st.get("q_ahead", st.get("q0_at_place", 0.0)) or 0.0)
+                    consume_ahead = min(q_ahead, decrease)
+                    q_ahead -= consume_ahead
+                    decrease_after_q = decrease - consume_ahead
+                    st["q_ahead"] = float(q_ahead)
+                else:
+                    decrease_after_q = 0.0
+
+                higher_open_exists = any(
+                    float(other_key[3]) > price
+                    and float(other_state.get("remaining", 0.0) or 0.0) > 0
+                    for other_key, other_state in runner_orders
                 )
 
-                MAKER_UNDER_LAY_GRID_ACTIVE_ORDERS += 1
-
-                order_model.by_key[key] = MyOrdersAtPrice(
-                    my_lay=float(grid_stake),
-                    my_back=0.0,
-                    matched=0.0,
+                price_reached = (
+                    best_visual_l_price is not None
+                    and float(best_visual_l_price) <= price + 1e-9
                 )
+
+                can_match = (
+                    MAKER_UNDER_LAY_GRID_MATCHING_ENABLED
+                    and frame_i > 1
+                    and frame_i > placed_frame
+                    and okey not in placed_now_keys
+                    and price_reached
+                    and not higher_open_exists
+                )
+
+                if can_match:
+                    remaining_before = float(st.get("remaining", 0.0) or 0.0)
+
+                    if remaining_before > 0 and decrease_after_q > 0:
+                        matched_now = min(remaining_before, decrease_after_q)
+
+                        if matched_now > 0:
+                            st["matched"] = float(st.get("matched", 0.0) or 0.0) + matched_now
+                            st["remaining"] = remaining_before - matched_now
+                            st["status"] = "MATCHED" if float(st["remaining"]) <= 1e-9 else "PARTIAL"
+
+                st["prev_l_qty"] = float(current_l_qty)
+                st["current_l_qty"] = float(current_l_qty)
+
+                remaining = float(st.get("remaining", 0.0) or 0.0)
+                matched = float(st.get("matched", 0.0) or 0.0)
+
+                MAKER_UNDER_LAY_GRID_MATCHED_TOTAL += matched
+
+                if remaining > 0:
+                    MAKER_UNDER_LAY_GRID_ACTIVE_ORDERS += 1
+                    MAKER_UNDER_LAY_GRID_LIABILITY_TOTAL += remaining * max(0.0, price - 1.0)
+
+                    order_model.by_key[okey] = MyOrdersAtPrice(
+                        my_lay=float(remaining),
+                        my_back=0.0,
+                        matched=float(matched),
+                    )
 
 
 def stream_replay(args: argparse.Namespace) -> int:
@@ -3316,6 +3567,8 @@ def stream_replay(args: argparse.Namespace) -> int:
                         _apply_maker_under_lay_grid_orders(
                             markets=markets,
                             order_model=order_model,
+                            pt=int(next_frame_pt),
+                            frame_no=int(frames),
                         )
 
                     global ENGINE_V2_OVERLAY_LINE
@@ -3329,7 +3582,7 @@ def stream_replay(args: argparse.Namespace) -> int:
                             ENGINE_V2_OVERLAY_LINE = (
                                 ENGINE_V2_OVERLAY_LINE
                                 + f" maker_grid_active={MAKER_UNDER_LAY_GRID_ACTIVE_ORDERS}"
-                                + " maker_matching=OFF"
+                                + (" maker_matching=ON" if MAKER_UNDER_LAY_GRID_MATCHING_ENABLED else " maker_matching=OFF") + f" maker_matched={MAKER_UNDER_LAY_GRID_MATCHED_TOTAL:.2f}" + f" maker_liability={MAKER_UNDER_LAY_GRID_LIABILITY_TOTAL:.2f}"
                             )
                         ENGINE_V2_TAPE_LINE = _engine_v2_tape_line(
                             pt=int(next_frame_pt),
@@ -3436,6 +3689,36 @@ def stream_replay(args: argparse.Namespace) -> int:
                         return 0
 
                     if interactive:
+                        def _rebuild_maker_grid_to_history_index(target_idx: int) -> None:
+                            _maker_grid_hard_reset_state(order_model)
+
+                            if not MAKER_UNDER_LAY_GRID_ENABLED:
+                                return
+
+                            for _replay_idx in range(0, int(target_idx) + 1):
+                                _hs = history[_replay_idx]
+                                _apply_maker_under_lay_grid_orders(
+                                    markets=copy.deepcopy(_hs.markets),
+                                    order_model=order_model,
+                                    pt=int(_hs.frame_pt),
+                                    frame_no=int(_hs.frame_index),
+                                )
+
+                            if bool(getattr(args, "engine_v2_overlay", False)):
+                                _overlay = _engine_v2_overlay_line(
+                                    pt=int(history[target_idx].frame_pt),
+                                    balance=balance,
+                                    orders=engine_v2_orders,
+                                )
+                                _overlay += (
+                                    f" maker_grid_active={MAKER_UNDER_LAY_GRID_ACTIVE_ORDERS}"
+                                    + (" maker_matching=ON" if MAKER_UNDER_LAY_GRID_MATCHING_ENABLED else " maker_matching=OFF")
+                                    + f" maker_matched={MAKER_UNDER_LAY_GRID_MATCHED_TOTAL:.2f}"
+                                    + f" maker_liability={MAKER_UNDER_LAY_GRID_LIABILITY_TOTAL:.2f}"
+                                )
+                                globals()["ENGINE_V2_OVERLAY_LINE"] = _overlay
+
+
                         def _apply_snap(idx: int) -> None:
                             nonlocal markets, meta_by_market_id, frames, next_frame_pt, earliest_start_pt, hist_i, selected_ids
                             nonlocal interactive_err
@@ -3449,6 +3732,7 @@ def stream_replay(args: argparse.Namespace) -> int:
                                 next_frame_pt = int(s.frame_pt + cadence_ms)
                                 earliest_start_pt = s.earliest_start_pt
                                 hist_i = idx
+                                _rebuild_maker_grid_to_history_index(hist_i)
                                 interactive_err = None
                                 render_dashboard(
                                     pt=int(s.frame_pt),
@@ -3650,10 +3934,14 @@ def stream_replay(args: argparse.Namespace) -> int:
 
 def main() -> int:
     args = parse_args()
-    global MAKER_UNDER_LAY_GRID_ENABLED
-    MAKER_UNDER_LAY_GRID_ENABLED = bool(getattr(args, "maker_under_lay_grid", False))
+
     global SIMULATE_ORDERS_ENABLED
+    global MAKER_UNDER_LAY_GRID_ENABLED
+    global MAKER_UNDER_LAY_GRID_MATCHING_ENABLED
+
     SIMULATE_ORDERS_ENABLED = bool(getattr(args, "simulate_orders", False))
+    MAKER_UNDER_LAY_GRID_ENABLED = bool(getattr(args, "maker_under_lay_grid", False))
+    MAKER_UNDER_LAY_GRID_MATCHING_ENABLED = bool(getattr(args, "maker_under_lay_grid_match", False))
 
     return stream_replay(args)
 
