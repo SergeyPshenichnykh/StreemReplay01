@@ -141,7 +141,8 @@ def _inject_status(lines: list[str], page: str, paused: bool) -> list[str]:
     state = "PAUSED" if paused else "RUN"
     status = (
         f"STABLE_PAGE={page:<6}  STATE={state:<6}  "
-        "KEYS: 1=totals  2=correct_score  3=orders  a=all  space=pause/resume  q=quit"
+        "KEYS: 1=totals  2=correct_score  3=orders  a=all  "
+        "j/k=up/down  f/b=page-scroll  g=top  space=pause/resume  q=quit"
     )
 
     out = list(lines)
@@ -157,13 +158,23 @@ def _inject_status(lines: list[str], page: str, paused: bool) -> list[str]:
     return out
 
 
-def _paint_frame(frame: list[str], page: str, paused: bool) -> None:
-    size = shutil.get_terminal_size(fallback=(240, 70))
+def _paint_frame(frame: list[str], page: str, paused: bool, scroll: int = 0) -> None:
+    size = shutil.get_terminal_size(fallback=(260, 70))
     cols = max(20, int(size.columns))
     rows = max(5, int(size.lines) - 1)
 
     lines = _filter_frame(frame, page)
     lines = _inject_status(lines, page, paused)
+
+    scroll = max(0, int(scroll or 0))
+
+    # Header/status fixed, body scrolls vertically.
+    if scroll > 0 and len(lines) > 8:
+        fixed_count = min(5, len(lines))
+        fixed = lines[:fixed_count]
+        body = lines[fixed_count:]
+        lines = fixed + body[scroll:]
+
     visible = lines[:rows]
 
     out: list[str] = ["\033[?25l", "\033[H"]
@@ -215,7 +226,8 @@ def _send_signal_safe(proc: subprocess.Popen[bytes], sig: int) -> None:
 def _stable_stream(cmd: list[str], page: str) -> int:
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
-    _term_size = shutil.get_terminal_size(fallback=(240, 70))
+
+    _term_size = shutil.get_terminal_size(fallback=(260, 70))
     env["COLUMNS"] = str(_term_size.columns)
     env["LINES"] = str(_term_size.lines)
 
@@ -243,6 +255,10 @@ def _stable_stream(cmd: list[str], page: str) -> int:
     current_page = page or "totals"
     paused = False
     running = True
+    scroll = 0
+
+    def repaint() -> None:
+        _paint_frame(last_frame or frame, current_page, paused, scroll=scroll)
 
     try:
         _safe_write("\033[?1049h\033[?25l\033[H\033[J")
@@ -263,23 +279,42 @@ def _stable_stream(cmd: list[str], page: str) -> int:
                     for ch in raw_key:
                         if ch == "1":
                             current_page = "totals"
-                            _paint_frame(last_frame or frame, current_page, paused)
+                            scroll = 0
+                            repaint()
                         elif ch == "2":
                             current_page = "cs"
-                            _paint_frame(last_frame or frame, current_page, paused)
+                            scroll = 0
+                            repaint()
                         elif ch == "3":
                             current_page = "orders"
-                            _paint_frame(last_frame or frame, current_page, paused)
+                            scroll = 0
+                            repaint()
                         elif ch.lower() == "a":
                             current_page = "all"
-                            _paint_frame(last_frame or frame, current_page, paused)
+                            scroll = 0
+                            repaint()
+                        elif ch.lower() == "j":
+                            scroll += 5
+                            repaint()
+                        elif ch.lower() == "k":
+                            scroll = max(0, scroll - 5)
+                            repaint()
+                        elif ch.lower() == "f":
+                            scroll += 20
+                            repaint()
+                        elif ch.lower() == "b":
+                            scroll = max(0, scroll - 20)
+                            repaint()
+                        elif ch.lower() == "g":
+                            scroll = 0
+                            repaint()
                         elif ch == " ":
                             paused = not paused
                             if paused:
                                 _send_signal_safe(proc, signal.SIGSTOP)
                             else:
                                 _send_signal_safe(proc, signal.SIGCONT)
-                            _paint_frame(last_frame or frame, current_page, paused)
+                            repaint()
                         elif ch.lower() == "q":
                             running = False
                             _send_signal_safe(proc, signal.SIGINT)
@@ -303,14 +338,14 @@ def _stable_stream(cmd: list[str], page: str) -> int:
                         if line.startswith("BALANCE:") and frame:
                             last_frame = frame
                             if not paused:
-                                _paint_frame(last_frame, current_page, paused)
+                                _paint_frame(last_frame, current_page, paused, scroll=scroll)
                             frame = [line]
                         else:
                             frame.append(line)
 
         if frame:
             last_frame = frame
-            _paint_frame(last_frame, current_page, paused)
+            _paint_frame(last_frame, current_page, paused, scroll=scroll)
 
         try:
             return int(proc.wait(timeout=1.0))

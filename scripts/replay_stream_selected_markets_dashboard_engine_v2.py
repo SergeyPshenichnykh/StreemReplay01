@@ -906,6 +906,43 @@ def render_runner_ladder(
     return out
 
 
+
+def _visible_len_no_ansi(s: str) -> int:
+    try:
+        return len(_strip_ansi(s))
+    except NameError:
+        return len(re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", s))
+
+
+def _pad_visible_no_truncate(s: str, width: int) -> str:
+    pad = max(0, width - _visible_len_no_ansi(s))
+    return s + (" " * pad)
+
+
+def print_columns_full(columns: list[list[str]], col_width: int, gap: str = " ") -> None:
+    """
+    Print columns without truncating cell content.
+
+    This keeps all ladder fields visible:
+    MYL / Q0 / Q1 / L / P / B / MYB / VOL / MAT.
+    """
+    if not columns:
+        return
+
+    max_rows = max(len(c) for c in columns)
+
+    widths: list[int] = []
+    for col in columns:
+        w = max([_visible_len_no_ansi(x) for x in col] + [int(col_width)])
+        widths.append(w)
+
+    for row_i in range(max_rows):
+        parts: list[str] = []
+        for col_i, col in enumerate(columns):
+            cell = col[row_i] if row_i < len(col) else ""
+            parts.append(_pad_visible_no_truncate(cell, widths[col_i]))
+        print(gap.join(parts).rstrip())
+
 def print_columns(columns: list[list[str]], *, col_width: int = 42, gap: str = "  ") -> None:
     if not columns:
         return
@@ -1974,8 +2011,8 @@ def render_dashboard(
             return
 
         # Wrap totals ladders into fixed 5-column rows.
-        # Totals layout: 5 columns, 30 ladder rows, auto width.
-        force_cols_per_row = 5
+        # Totals layout: 3 columns per row, 30 ladder rows, full width.
+        force_cols_per_row = 3
         gap = " "
         term_cols = int(shutil.get_terminal_size(fallback=(260, 70)).columns)
         effective_col_width = max(
@@ -1984,7 +2021,7 @@ def render_dashboard(
         )
 
         for start_i in range(0, len(cols), force_cols_per_row):
-            print_columns(
+            print_columns_full(
                 cols[start_i : start_i + force_cols_per_row],
                 col_width=effective_col_width,
                 gap=gap,
@@ -2006,7 +2043,9 @@ def render_dashboard(
             print("-" * 110)
             print("-" * 110)
 
-            cs_cols_per_row = 4
+            # Correct Score layout: 3 columns per row, 20 ladder rows, full width.
+            # This gives 4 visual rows for the current Correct Score runner set.
+            cs_cols_per_row = 3
             cs_gap = "  "
             term_cols = int(shutil.get_terminal_size(fallback=(240, 70)).columns)
             cs_auto_col_width = max(
@@ -2038,12 +2077,12 @@ def render_dashboard(
                     )
 
                     if len(cols_cs) >= cs_cols_per_row:
-                        print_columns(cols_cs, col_width=cs_effective_col_width, gap=cs_gap)
+                        print_columns_full(cols_cs, col_width=cs_effective_col_width, gap=cs_gap)
                         print()
                         cols_cs = []
 
                 if cols_cs:
-                    print_columns(cols_cs, col_width=cs_effective_col_width, gap=cs_gap)
+                    print_columns_full(cols_cs, col_width=cs_effective_col_width, gap=cs_gap)
 
                 print("-" * 110)
 
