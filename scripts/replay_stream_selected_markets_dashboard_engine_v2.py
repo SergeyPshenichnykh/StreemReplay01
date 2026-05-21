@@ -51,6 +51,7 @@ from replay_stream_selected_markets_features import (
 )
 
 
+SIMULATE_ORDERS_ENABLED = False
 DEFAULT_SNAPSHOTS_CSV = Path("replay/selected_markets_250ms.csv")
 
 
@@ -598,6 +599,11 @@ def parse_args() -> argparse.Namespace:
         help="JSON rules for filtered shadow bot V2.",
     )
     p.add_argument(
+        "--simulate-orders",
+        action="store_true",
+        help="Enable legacy synthetic order execution/matching simulation. Default OFF for clean-sheet strategy work.",
+    )
+    p.add_argument(
         "--engine-v2-orders",
         default="replay/delta_10s_macro_min10/filtered_shadow_bot_v2_no_asian.csv",
         help="CSV with V2 shadow orders.",
@@ -771,6 +777,9 @@ def render_runner_ladder(
     price_low: float | None = None,
     price_high: float | None = None,
 ) -> list[str]:
+    if not SIMULATE_ORDERS_ENABLED:
+        order_model = None
+
     center = ladder_center_price(runner, mode=center_mode)
     if center is None:
         return [f"{fmt_text(runner.name or str(runner.selection_id), 22)} (no ladder data)"]
@@ -3024,18 +3033,20 @@ def stream_replay(args: argparse.Namespace) -> int:
                                 )
 
                     if bool(getattr(args, "engine_v2_overlay", False)):
-                        _engine_v2_apply_orders_to_order_model(
-                            pt=int(next_frame_pt),
+                        if SIMULATE_ORDERS_ENABLED:
+                            _engine_v2_apply_orders_to_order_model(
+                                pt=int(next_frame_pt),
+                                markets=markets,
+                                order_model=order_model,
+                                orders=engine_v2_orders,
+                                balance=balance,
+                            )
+
+                    if SIMULATE_ORDERS_ENABLED:
+                        update_order_model_from_current_ladder(
                             markets=markets,
                             order_model=order_model,
-                            orders=engine_v2_orders,
-                            balance=balance,
                         )
-
-                    update_order_model_from_current_ladder(
-                        markets=markets,
-                        order_model=order_model,
-                    )
 
                     global ENGINE_V2_OVERLAY_LINE
                     if bool(getattr(args, "engine_v2_overlay", False)):
@@ -3363,6 +3374,9 @@ def stream_replay(args: argparse.Namespace) -> int:
 
 def main() -> int:
     args = parse_args()
+    global SIMULATE_ORDERS_ENABLED
+    SIMULATE_ORDERS_ENABLED = bool(getattr(args, "simulate_orders", False))
+
     return stream_replay(args)
 
 
