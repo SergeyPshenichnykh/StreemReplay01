@@ -1,0 +1,51 @@
+ENGINE V3 FINAL VERDICT
+
+mode = queue_aware_replay_execution
+real_pnl = NO
+pnl_proxy_with_fallback_exit = YES
+
+settings:
+  fill_source = match_plus_visible_remove
+  place_delay_sec = 5 in-play only
+  cancel_delay_sec = 5 in-play only
+  fill_horizon_sec = 30
+  fallback_exit_after_actual_fill = YES
+
+result:
+  orders = 101
+  REQUEST_PLACE = 101
+  PLACE = 101
+  FILL = 28
+  PARTIAL_FILL = 3
+  REQUEST_CANCEL = 76
+  CANCEL = 71
+  CANCEL_REMAINING = 1
+  EXIT = 29
+  SETTLE = 29
+
+settlement:
+  proxy_proportional = 5
+  fallback_after_fill = 24
+
+balance:
+  start_balance = 1000.000000
+  pnl_v3 = -2.353404
+  final_balance_v3 = 997.646596
+
+reference:
+  V2 pnl_proxy = +18.277677
+  V3 before fallback-exit pnl = +1.267594
+  V3 after fallback-exit pnl = -2.353404
+
+execution rules:
+  PRE-PLAY:
+    place_delay_sec = 0
+    cancel_delay_sec = 0
+
+  IN-PLAY:
+    place_delay_sec = 5
+    cancel_delay_sec = 5
+
+exposure:
+  BACK exposure = stake
+  LAY exposure = stake * (price - 1)

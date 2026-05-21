@@ -1,0 +1,32 @@
+{
+  "dry_run": true,
+  "poll_interval_s": 0.25,
+  "markets": [
+    {
+      "market_id": "1.234567890",
+      "market_name_regex": "Correct Score|Over/Under|Match Odds",
+      "min_legs": 2
+    }
+  ],
+  "signal": {
+    "odds_sources": ["best_lay", "best_back"],
+    "min_margin_pct": 0.2,
+    "min_size": 10.0,
+    "min_legs": 2,
+    "min_odds": 1.01,
+    "max_odds": 1000.0
+  },
+  "staking": {
+    "method": "fixed-stake",
+    "total_stake": 20.0,
+    "target_profit": 2.0,
+    "min_stake": 2.0,
+    "stake_decimals": 2
+  },
+  "risk": {
+    "max_orders_per_market": 1,
+    "max_total_stake_per_market": 100.0,
+    "max_total_stake_per_event": 200.0,
+    "max_total_stake_per_day": 500.0
+  }
+}

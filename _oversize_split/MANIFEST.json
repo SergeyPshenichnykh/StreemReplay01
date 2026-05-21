@@ -1,0 +1,29 @@
+[
+  {
+    "path": "_archives/streem_replay_ABSOLUTE_FULL_FINAL_20260521_030447.tar.gz",
+    "size": 173803014,
+    "sha256": "075242b5401b48f1a2cac122da9016a5e5b150127a234e622092f9be5bca05c3",
+    "parts": [
+      "_oversize_split/_archives/streem_replay_ABSOLUTE_FULL_FINAL_20260521_030447.tar.gz/streem_replay_ABSOLUTE_FULL_FINAL_20260521_030447.tar.gz.part_aa",
+      "_oversize_split/_archives/streem_replay_ABSOLUTE_FULL_FINAL_20260521_030447.tar.gz/streem_replay_ABSOLUTE_FULL_FINAL_20260521_030447.tar.gz.part_ab"
+    ]
+  },
+  {
+    "path": "replay/delta_10s/action_log.csv",
+    "size": 125193997,
+    "sha256": "683c404235a9516276b2482df0a45fc93bf9a0567c2699526ff44f7295f90948",
+    "parts": [
+      "_oversize_split/replay/delta_10s/action_log.csv/action_log.csv.part_aa",
+      "_oversize_split/replay/delta_10s/action_log.csv/action_log.csv.part_ab"
+    ]
+  },
+  {
+    "path": "replay/delta_10s/price_level_delta.csv",
+    "size": 130676422,
+    "sha256": "c77a832a378c387e124e0206ccd8c1aa95f0c809dd3d92d13b08d3a7cd342dbb",
+    "parts": [
+      "_oversize_split/replay/delta_10s/price_level_delta.csv/price_level_delta.csv.part_aa",
+      "_oversize_split/replay/delta_10s/price_level_delta.csv/price_level_delta.csv.part_ab"
+    ]
+  }
+]

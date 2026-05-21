@@ -1,0 +1,42 @@
+ENGINE V2 FINAL VERDICT
+
+strategy = cyclic_cross_market_package_rebalance
+bot = filtered_shadow_bot_v2_no_asian
+mode = replay_execution_proxy
+real_pnl = NO
+pnl_proxy = YES
+
+orders = 101
+PLACE = 101
+FILL = 87
+EXIT = 87
+SKIP = 0
+
+PLACE_FILL_EXIT = 87
+PLACE_ONLY = 14
+PLACE_EXIT_WITHOUT_FILL = 0
+
+start_balance = 1000.000000
+final_balance_proxy = 1018.277677
+pnl_proxy = 18.277677
+
+roi_on_stake_pct = 4.524177
+roi_on_cumulative_liability_pct = 9.644194
+
+notes:
+  BACK = ЗА
+  LAY = ПРОТИ
+  BACK exposure = stake
+  LAY exposure = stake * (price - 1)
+
+blocked_markets:
+  ASIAN_HANDICAP
+
+included_markets:
+  MATCH_ODDS
+  OVER_UNDER_15
+  OVER_UNDER_25
+  OVER_UNDER_35
+  TOTAL_GOALS
+  TEAM_TOTAL_GOALS
+  FIRST_HALF_GOALS_05

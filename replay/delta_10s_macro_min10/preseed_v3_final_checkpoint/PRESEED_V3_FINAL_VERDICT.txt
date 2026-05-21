@@ -1,0 +1,43 @@
+PRESEED V3 FINAL VERDICT
+
+strategy = PRESEED_LAY_UNDER_GRID
+mode = queue_aware_preplay_seed
+real_pnl = NO
+pnl_proxy_with_tick_exit = YES
+
+entry:
+  side = LAY
+  runner = Under
+  markets = OVER_UNDER_0.5..8.5
+  price_grid = 1.01..1.25
+  seed_time = kickoff - 1 minute
+  stake = 4.00 per order
+
+execution:
+  preplay_place_delay_sec = 0
+  inplay_place_delay_sec = 5
+  queue_model = enabled
+  fill_source = match_plus_visible_remove
+
+exit:
+  settlement = preseed_tick_exit
+  take_ticks = 3
+  stop_ticks = 2
+
+result:
+  orders = 225
+  REQUEST_PLACE = 225
+  PLACE = 225
+  FILL = 73
+  PARTIAL_FILL = 5
+  EXIT = 58
+  SETTLE = 58
+
+balance:
+  start_balance = 1000.000000
+  pnl_v3 = +28.715733
+  final_balance_v3 = 1028.715733
+
+conclusion:
+  Pre-seed before kickoff materially improves execution because the order is already in queue before in-play delay applies.
+  Current best tested variant is PRESEED_LAY_UNDER_GRID with take_ticks=3 and stop_ticks=2.

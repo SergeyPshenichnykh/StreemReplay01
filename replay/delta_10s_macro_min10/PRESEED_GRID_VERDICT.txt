@@ -1,0 +1,35 @@
+PRESEED GRID VERDICT
+
+Main result:
+  PRESEED_LAY_UNDER is currently best.
+
+Best tested config:
+  side = LAY
+  runner = Under
+  price_grid = 1.01..1.25
+  seed_time = kickoff - 1 minute
+  take_ticks = 3
+  stop_ticks = 2
+
+Result:
+  filled_or_partial = 74
+  wins = 58
+  losses = 0
+  no_exit = 16
+  pnl = +28.715730
+  final_balance = 1028.715730
+
+Secondary result:
+  PRESEED_BACK_UNDER
+  take_ticks = 3
+  stop_ticks = 2
+  wins = 57
+  losses = 1
+  no_exit = 14
+  pnl = +12.134539
+  final_balance = 1012.134539
+
+Conclusion:
+  In-play V3 with 5 sec delay is weak.
+  Pre-seed before kickoff avoids 5 sec placement delay and materially improves fill quality.
+  Next step: integrate take/stop settlement into V3 engine, not only post-process audit.

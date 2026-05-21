@@ -1,0 +1,21 @@
+FILTERED SHADOW BOT V2 NO ASIAN SUMMARY
+
+real_pnl = NO
+pnl_proxy = YES
+blocked = ASIAN_HANDICAP
+
+orders = 101
+stake = 404.00
+pnl_proxy = 18.277677
+roi_proxy_pct = 4.524177
+fill_rate_pct = 86.14
+exit_rate_pct = 86.14
+
+BY_MARKET
+MATCH_ODDS: count=31 stake=124.00 pnl=4.848223 roi_pct=3.909857
+OVER_UNDER_25: count=13 stake=52.00 pnl=3.743121 roi_pct=7.198310
+OVER_UNDER_15: count=19 stake=76.00 pnl=3.040127 roi_pct=4.000167
+OVER_UNDER_35: count=12 stake=48.00 pnl=2.315783 roi_pct=4.824548
+TOTAL_GOALS: count=15 stake=60.00 pnl=2.000923 roi_pct=3.334872
+FIRST_HALF_GOALS_05: count=6 stake=24.00 pnl=1.197675 roi_pct=4.990312
+TEAM_TOTAL_GOALS: count=5 stake=20.00 pnl=1.131825 roi_pct=5.659125

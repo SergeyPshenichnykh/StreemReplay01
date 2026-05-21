@@ -1,0 +1,48 @@
+
+================================================================================
+PRESEED_LAY_UNDER
+filled_or_partial = 74
+take=1 stop=2 wins=58 losses=0 no_exit=16 pnl=28.428256 final=1028.428256
+take=1 stop=3 wins=54 losses=0 no_exit=20 pnl=23.563892 final=1023.563892
+take=1 stop=5 wins=47 losses=0 no_exit=27 pnl=18.057088 final=1018.057088
+take=2 stop=2 wins=58 losses=0 no_exit=16 pnl=28.575685 final=1028.575685
+take=2 stop=3 wins=54 losses=0 no_exit=20 pnl=23.711321 final=1023.711321
+take=2 stop=5 wins=47 losses=0 no_exit=27 pnl=18.057088 final=1018.057088
+take=3 stop=2 wins=58 losses=0 no_exit=16 pnl=28.715730 final=1028.715730
+take=3 stop=3 wins=54 losses=0 no_exit=20 pnl=23.851366 final=1023.851366
+take=3 stop=5 wins=47 losses=0 no_exit=27 pnl=18.160455 final=1018.160455
+
+BEST
+take=3 stop=2 wins=58 losses=0 no_exit=16 pnl=28.715730 final=1028.715730
+BEST BY_MARKET
+OVER_UNDER_05: wins=0 losses=0 no_exit=2 pnl=0.000000
+OVER_UNDER_15: wins=0 losses=0 no_exit=2 pnl=0.000000
+OVER_UNDER_25: wins=2 losses=0 no_exit=3 pnl=2.082502
+OVER_UNDER_35: wins=23 losses=0 no_exit=2 pnl=13.732021
+OVER_UNDER_45: wins=23 losses=0 no_exit=2 pnl=11.380661
+OVER_UNDER_55: wins=8 losses=0 no_exit=2 pnl=1.295189
+OVER_UNDER_65: wins=2 losses=0 no_exit=2 pnl=0.225357
+OVER_UNDER_75: wins=0 losses=0 no_exit=1 pnl=0.000000
+
+================================================================================
+PRESEED_BACK_UNDER
+filled_or_partial = 72
+take=1 stop=2 wins=63 losses=1 no_exit=8 pnl=9.009966 final=1009.009966
+take=1 stop=3 wins=63 losses=1 no_exit=8 pnl=9.009966 final=1009.009966
+take=1 stop=5 wins=63 losses=1 no_exit=8 pnl=9.009966 final=1009.009966
+take=2 stop=2 wins=60 losses=1 no_exit=11 pnl=11.004946 final=1011.004946
+take=2 stop=3 wins=60 losses=1 no_exit=11 pnl=11.004946 final=1011.004946
+take=2 stop=5 wins=60 losses=1 no_exit=11 pnl=11.004946 final=1011.004946
+take=3 stop=2 wins=57 losses=1 no_exit=14 pnl=12.134539 final=1012.134539
+take=3 stop=3 wins=57 losses=1 no_exit=14 pnl=12.134539 final=1012.134539
+take=3 stop=5 wins=57 losses=1 no_exit=14 pnl=12.134539 final=1012.134539
+
+BEST
+take=3 stop=2 wins=57 losses=1 no_exit=14 pnl=12.134539 final=1012.134539
+BEST BY_MARKET
+OVER_UNDER_35: wins=13 losses=0 no_exit=0 pnl=1.735426
+OVER_UNDER_45: wins=21 losses=1 no_exit=2 pnl=2.969779
+OVER_UNDER_55: wins=17 losses=0 no_exit=3 pnl=6.407366
+OVER_UNDER_65: wins=5 losses=0 no_exit=3 pnl=0.903156
+OVER_UNDER_75: wins=1 losses=0 no_exit=3 pnl=0.118812
+OVER_UNDER_85: wins=0 losses=0 no_exit=3 pnl=0.000000

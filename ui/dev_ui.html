@@ -1,0 +1,380 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>betfair_bot Dev UI</title>
+    <style>
+      :root {
+        --bg: #0b0f14;
+        --panel: #0f1620;
+        --text: #e6edf3;
+        --muted: #9aa4b2;
+        --grid: #223041;
+        --blue: #1f6feb;
+        --cyan: #2dd4bf;
+        --pink: #a855f7;
+        --gray: #6b7280;
+        --red: #ef4444;
+        --yellow: #f59e0b;
+      }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji",
+          "Segoe UI Emoji";
+      }
+      header {
+        padding: 10px 14px;
+        border-bottom: 1px solid var(--grid);
+        display: flex;
+        align-items: baseline;
+        gap: 12px;
+      }
+      header .title {
+        font-weight: 700;
+      }
+      header .meta {
+        color: var(--muted);
+        font-size: 12px;
+      }
+      .wrap {
+        display: grid;
+        grid-template-rows: auto auto 1fr;
+        gap: 10px;
+        padding: 10px;
+      }
+      .row {
+        display: grid;
+        grid-auto-flow: column;
+        grid-auto-columns: minmax(260px, 1fr);
+        gap: 10px;
+        align-items: start;
+      }
+      .card {
+        background: var(--panel);
+        border: 1px solid var(--grid);
+        border-radius: 10px;
+        overflow: hidden;
+      }
+      .card .h {
+        padding: 8px 10px;
+        font-size: 12px;
+        color: var(--muted);
+        border-bottom: 1px solid var(--grid);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .ladder {
+        display: grid;
+        grid-template-columns: 40px 58px 46px 58px 40px 46px;
+        font-variant-numeric: tabular-nums;
+        font-size: 11px;
+      }
+      .ladder .head {
+        background: #0b1220;
+        color: var(--muted);
+      }
+      .cell {
+        padding: 1px 5px;
+        border-bottom: 1px solid rgba(34, 48, 65, 0.6);
+        white-space: nowrap;
+      }
+      .p { background: rgba(31, 111, 235, 0.9); color: #fff; font-weight: 700; text-align: right; }
+      .l { background: rgba(168, 85, 247, 0.85); color: #fff; font-weight: 700; text-align: right; }
+      .b { background: rgba(45, 212, 191, 0.85); color: #071018; font-weight: 700; text-align: right; }
+      .my { background: rgba(107, 114, 128, 0.85); color: #fff; text-align: right; }
+      .muted { color: var(--muted); }
+      .cs {
+        display: grid;
+        grid-template-rows: auto 1fr;
+        gap: 10px;
+      }
+      .cs .top {
+        display: grid;
+        grid-template-columns: 1fr;
+        gap: 10px;
+      }
+      .table {
+        overflow: auto;
+        max-height: 300px;
+        border-top: 1px solid var(--grid);
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 12px;
+        font-variant-numeric: tabular-nums;
+      }
+      th, td {
+        border-bottom: 1px solid rgba(34, 48, 65, 0.6);
+        padding: 4px 6px;
+        text-align: right;
+      }
+      th:first-child, td:first-child { text-align: left; }
+      th { color: var(--muted); position: sticky; top: 0; background: #0b1220; }
+      .chart {
+        border-top: 1px solid var(--grid);
+        padding: 8px 10px;
+      }
+      canvas { width: 100%; height: 300px; display: block; background: #070a0f; border-radius: 8px; }
+      .status {
+        color: var(--muted);
+        font-size: 12px;
+        padding: 8px 10px;
+        border-top: 1px solid var(--grid);
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div class="title">betfair_bot Dev UI</div>
+      <div class="meta" id="meta">connecting…</div>
+    </header>
+    <div class="wrap">
+      <div class="row" id="totalsRow"></div>
+      <div class="card cs">
+        <div class="h">Correct Score (TEST14-style): table + overview chart (LTP over time)</div>
+        <div class="top">
+          <div class="table">
+            <table id="csTable">
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Back</th>
+                  <th>Lay</th>
+                  <th>LTP</th>
+                  <th>IP%</th>
+                  <th>High</th>
+                  <th>Low</th>
+                  <th>Range</th>
+                  <th>Volume</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <div class="chart">
+            <canvas id="csCanvas" width="1200" height="420"></canvas>
+          </div>
+          <div class="status" id="status"></div>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      const metaEl = document.getElementById("meta");
+      const totalsRow = document.getElementById("totalsRow");
+      const csTbody = document.querySelector("#csTable tbody");
+      const statusEl = document.getElementById("status");
+      const canvas = document.getElementById("csCanvas");
+      const ctx = canvas.getContext("2d");
+
+      const series = new Map(); // name -> [{t, y}]
+      let t0 = null;
+      let tLast = null;
+      let autoZoom = true;
+
+      function fmt(x, d=2) {
+        if (x === null || x === undefined) return "-";
+        if (typeof x !== "number") return String(x);
+        return x.toFixed(d);
+      }
+      function ipPct(ltp) {
+        if (!ltp || ltp <= 0) return "-";
+        return (100.0 / ltp).toFixed(1);
+      }
+
+      function renderTotals(totals) {
+        totalsRow.innerHTML = "";
+        for (const m of totals) {
+          const card = document.createElement("div");
+          card.className = "card";
+          const h = document.createElement("div");
+          h.className = "h";
+          h.textContent = `${m.market_id}  line=${m.line}`;
+          const grid = document.createElement("div");
+          grid.className = "ladder";
+          const heads = ["MYL","L","P","B","MYB","MATCH"];
+          for (const x of heads) {
+            const c = document.createElement("div");
+            c.className = "cell head";
+            c.textContent = x;
+            grid.appendChild(c);
+          }
+          for (const r of m.under_rows) {
+            const myl = document.createElement("div"); myl.className="cell my"; myl.textContent = "";
+            const L = document.createElement("div"); L.className="cell l"; L.textContent = (r.L !== null && r.L !== undefined) ? fmt(r.L, r.L>=100?0: (r.L>=10?1:2)) : "";
+            const P = document.createElement("div"); P.className="cell p"; P.textContent = fmt(r.P, r.P>=10?1:2);
+            const B = document.createElement("div"); B.className="cell b"; B.textContent = (r.B !== null && r.B !== undefined) ? fmt(r.B, r.B>=100?0: (r.B>=10?1:2)) : "";
+            const myb = document.createElement("div"); myb.className="cell my"; myb.textContent = "";
+            const mat = document.createElement("div"); mat.className="cell my"; mat.textContent = "";
+            grid.append(myl,L,P,B,myb,mat);
+          }
+          card.appendChild(h);
+          card.appendChild(grid);
+          totalsRow.appendChild(card);
+        }
+      }
+
+      function renderCsTable(rows) {
+        csTbody.innerHTML = "";
+        for (const r of rows) {
+          const tr = document.createElement("tr");
+          tr.innerHTML = `
+            <td>${r.name}</td>
+            <td>${r.best_back_px ? fmt(r.best_back_px, r.best_back_px>=10?1:2) : "-"}</td>
+            <td>${r.best_lay_px ? fmt(r.best_lay_px, r.best_lay_px>=10?1:2) : "-"}</td>
+            <td>${r.ltp ? fmt(r.ltp, r.ltp>=10?1:2) : "-"}</td>
+            <td>${ipPct(r.ltp)}</td>
+            <td>${r.high ? fmt(r.high, r.high>=10?1:2) : "-"}</td>
+            <td>${r.low ? fmt(r.low, r.low>=10?1:2) : "-"}</td>
+            <td>${r.range ? fmt(r.range, r.range>=10?1:2) : "-"}</td>
+            <td>${r.volume ? fmt(r.volume, 2) : "-"}</td>
+          `;
+          csTbody.appendChild(tr);
+        }
+      }
+
+      function drawChart() {
+        // Match backing store to CSS size for crisp text/lines.
+        const cssW = canvas.clientWidth || 1200;
+        const cssH = canvas.clientHeight || 300;
+        if (canvas.width !== cssW || canvas.height !== cssH) {
+          canvas.width = cssW;
+          canvas.height = cssH;
+        }
+        const w = canvas.width, h = canvas.height;
+        ctx.clearRect(0,0,w,h);
+        ctx.fillStyle = "#070a0f";
+        ctx.fillRect(0,0,w,h);
+
+        // Build global t range and y range from all series.
+        if (series.size === 0) return;
+        let tMin = Infinity, tMax = -Infinity, yMin = Infinity, yMax = -Infinity;
+        const allY = [];
+        for (const pts of series.values()) {
+          for (const p of pts) {
+            tMin = Math.min(tMin, p.t);
+            tMax = Math.max(tMax, p.t);
+            yMin = Math.min(yMin, p.y);
+            yMax = Math.max(yMax, p.y);
+            allY.push(p.y);
+          }
+        }
+        if (!isFinite(tMin) || !isFinite(tMax) || tMax <= tMin) return;
+
+        function percentile(arr, p) {
+          if (!arr.length) return null;
+          const a = [...arr].sort((x,y)=>x-y);
+          const idx = (a.length - 1) * p;
+          const lo = Math.floor(idx), hi = Math.ceil(idx);
+          if (lo === hi) return a[lo];
+          return a[lo] + (a[hi] - a[lo]) * (idx - lo);
+        }
+
+        if (autoZoom && allY.length) {
+          const p05 = percentile(allY, 0.05);
+          const p95 = percentile(allY, 0.95);
+          if (p05 !== null && p95 !== null && p95 > p05) {
+            yMin = p05; yMax = p95;
+          }
+        }
+        if (!isFinite(yMin) || !isFinite(yMax) || yMax <= yMin) { yMin = 1.01; yMax = 1000.0; }
+        const pad = (yMax - yMin) * 0.08;
+        yMin = Math.max(1.01, yMin - pad);
+        yMax = Math.min(1000.0, yMax + pad);
+
+        const left = 52, right = 10, top = 10, bottom = 26;
+        const plotW = w - left - right;
+        const plotH = h - top - bottom;
+
+        function X(t) { return left + ((t - tMin) / (tMax - tMin)) * plotW; }
+        function Y(y) { return top + (1 - (y - yMin) / (yMax - yMin)) * plotH; }
+
+        // Grid + axes
+        ctx.strokeStyle = "rgba(154,164,178,0.22)";
+        ctx.lineWidth = 1;
+        for (let i=0;i<=5;i++) {
+          const yy = top + (i/5)*plotH;
+          ctx.beginPath(); ctx.moveTo(left, yy); ctx.lineTo(left+plotW, yy); ctx.stroke();
+        }
+        ctx.fillStyle = "rgba(154,164,178,0.8)";
+        ctx.font = "12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace";
+        ctx.fillText(fmt(yMax, yMax>=10?1:2), 6, top+10);
+        ctx.fillText(fmt(yMin, yMin>=10?1:2), 6, top+plotH);
+
+        // Draw each series with deterministic color
+        let idx = 0;
+        const legend = [];
+        for (const [name, pts] of series.entries()) {
+          idx += 1;
+          const hue = (idx * 47) % 360;
+          ctx.strokeStyle = `hsl(${hue} 85% 60%)`;
+          ctx.lineWidth = 1.5;
+          ctx.beginPath();
+          let started = false;
+          for (const p of pts) {
+            const xx = X(p.t);
+            const yy = Y(p.y);
+            if (!started) { ctx.moveTo(xx,yy); started = true; }
+            else ctx.lineTo(xx,yy);
+          }
+          ctx.stroke();
+          if (legend.length < 14) legend.push({name, color: `hsl(${hue} 85% 60%)`});
+        }
+
+        // Legend (top-right)
+        ctx.font = "12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace";
+        let lx = left + plotW - 260, ly = top + 8;
+        ctx.fillStyle = "rgba(0,0,0,0.35)";
+        ctx.fillRect(lx - 6, top, 266, legend.length * 14 + 18);
+        ctx.fillStyle = "rgba(230,237,243,0.9)";
+        ctx.fillText(`Auto zoom: ${autoZoom ? "on" : "off"}`, lx, ly);
+        ly += 14;
+        for (const item of legend) {
+          ctx.fillStyle = item.color;
+          ctx.fillRect(lx, ly - 10, 10, 10);
+          ctx.fillStyle = "rgba(230,237,243,0.9)";
+          ctx.fillText(item.name.slice(0, 24), lx + 14, ly);
+          ly += 14;
+        }
+      }
+
+      function onFrame(frame) {
+        metaEl.textContent = `frame=${frame.frame} utc=${frame.utc} pt=${frame.pt}`;
+        if (frame.totals) renderTotals(frame.totals);
+        if (frame.cs && frame.cs.rows) {
+          renderCsTable(frame.cs.rows);
+          // Append LTP time series (full history)
+          const t = frame.pt;
+          if (t0 === null) t0 = t;
+          tLast = t;
+          for (const r of frame.cs.rows) {
+            if (!r.ltp) continue;
+            if (!series.has(r.name)) series.set(r.name, []);
+            series.get(r.name).push({t, y: r.ltp});
+          }
+          statusEl.textContent = `CS series=${series.size} points=${[...series.values()].reduce((a,v)=>a+v.length,0)} (history: start→end)`;
+          drawChart();
+        }
+      }
+
+      const es = new EventSource(`/events?ts=${Date.now()}`);
+      es.onopen = () => { metaEl.textContent = "connected"; };
+      es.onmessage = (ev) => {
+        try {
+          const obj = JSON.parse(ev.data);
+          if (obj.type === "stderr") { statusEl.textContent = obj.line; return; }
+          if (obj.type === "eof") { statusEl.textContent = `stream ended rc=${obj.rc}`; return; }
+          onFrame(obj);
+        } catch (e) {
+          statusEl.textContent = String(e);
+        }
+      };
+      es.onerror = () => { metaEl.textContent = "disconnected"; };
+    </script>
+  </body>
+</html>
