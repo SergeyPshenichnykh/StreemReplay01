@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import os
-import pty
 import re
 import selectors
 import signal
@@ -143,8 +142,7 @@ def _inject_status(lines: list[str], page: str, paused: bool) -> list[str]:
     status = (
         f"STABLE_PAGE={page:<6}  STATE={state:<6}  "
         "KEYS: 1=totals  2=correct_score  3=orders  a=all  "
-        "j/k=scroll  PgUp/PgDn=page-scroll  Home/g=top  End=bottom  "
-        "f/b=engine-seek  space=pause/resume  q=quit"
+        "j/k=up/down  PgUp/PgDn=page-scroll  Home=top  f/b=engine-seek  space=pause/resume  q=quit"
     )
 
     out = list(lines)
@@ -170,6 +168,7 @@ def _paint_frame(frame: list[str], page: str, paused: bool, scroll: int = 0) -> 
 
     scroll = max(0, int(scroll or 0))
 
+    # Header/status fixed, body scrolls vertically.
     if scroll > 0 and len(lines) > 8:
         fixed_count = min(5, len(lines))
         fixed = lines[:fixed_count]
@@ -216,62 +215,23 @@ def _restore_tty(fd: int | None, old: list[int] | None) -> None:
         pass
 
 
+
+def _forward_key_to_child(proc: subprocess.Popen[bytes], key: str) -> None:
+    try:
+        if proc.poll() is not None or proc.stdin is None:
+            return
+        proc.stdin.write(key.encode(errors="ignore"))
+        proc.stdin.flush()
+    except Exception:
+        pass
+
+
 def _send_signal_safe(proc: subprocess.Popen[bytes], sig: int) -> None:
     try:
         if proc.poll() is None:
             proc.send_signal(sig)
     except Exception:
         pass
-
-
-def _forward_key_to_child(child_pty_master: int | None, key: str) -> None:
-    if child_pty_master is None:
-        return
-
-    try:
-        os.write(child_pty_master, key.encode(errors="ignore"))
-    except Exception:
-        pass
-
-
-def _parse_keys(raw: str) -> list[str]:
-    keys: list[str] = []
-    i = 0
-
-    while i < len(raw):
-        seq = raw[i:]
-
-        if seq.startswith("\x1b[A") or seq.startswith("\x1bOA"):
-            keys.append("UP")
-            i += 3
-        elif seq.startswith("\x1b[B") or seq.startswith("\x1bOB"):
-            keys.append("DOWN")
-            i += 3
-        elif seq.startswith("\x1b[5~"):
-            keys.append("PAGEUP")
-            i += 4
-        elif seq.startswith("\x1b[6~"):
-            keys.append("PAGEDOWN")
-            i += 4
-        elif seq.startswith("\x1b[H") or seq.startswith("\x1bOH"):
-            keys.append("HOME")
-            i += 3
-        elif seq.startswith("\x1b[F") or seq.startswith("\x1bOF"):
-            keys.append("END")
-            i += 3
-        elif seq.startswith("\x1b[1~"):
-            keys.append("HOME")
-            i += 4
-        elif seq.startswith("\x1b[4~"):
-            keys.append("END")
-            i += 4
-        elif raw[i] == "\x1b":
-            i += 1
-        else:
-            keys.append(raw[i])
-            i += 1
-
-    return keys
 
 
 def _stable_stream(cmd: list[str], page: str) -> int:
@@ -282,44 +242,14 @@ def _stable_stream(cmd: list[str], page: str) -> int:
     env["COLUMNS"] = str(_term_size.columns)
     env["LINES"] = str(_term_size.lines)
 
-    control_fifo = f"/tmp/streem_replay_control_{os.getpid()}_{int(time.time() * 1000)}.fifo"
-    control_fd: int | None = None
-    try:
-        if os.path.exists(control_fifo):
-            os.unlink(control_fifo)
-        os.mkfifo(control_fifo, 0o600)
-        env["STREEM_REPLAY_CONTROL_FIFO"] = control_fifo
-        # Open RDWR so FIFO never blocks when engine opens the other side.
-        control_fd = os.open(control_fifo, os.O_RDWR | os.O_NONBLOCK)
-    except Exception:
-        control_fifo = ""
-        control_fd = None
-
-    child_pty_master: int | None = None
-    child_pty_slave: int | None = None
-
-    try:
-        child_pty_master, child_pty_slave = pty.openpty()
-    except Exception:
-        child_pty_master = None
-        child_pty_slave = None
-
     proc = subprocess.Popen(
         [cmd[0], "-u", *cmd[1:]],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        stdin=child_pty_slave if child_pty_slave is not None else subprocess.DEVNULL,
+        stdin=subprocess.PIPE,
         bufsize=0,
         env=env,
-        close_fds=True,
     )
-
-    if child_pty_slave is not None:
-        try:
-            os.close(child_pty_slave)
-        except Exception:
-            pass
-        child_pty_slave = None
 
     assert proc.stdout is not None
 
@@ -338,19 +268,7 @@ def _stable_stream(cmd: list[str], page: str) -> int:
     running = True
     scroll = 0
 
-    def max_scroll_for_current_frame() -> int:
-        lines = _inject_status(_filter_frame(last_frame or frame, current_page), current_page, paused)
-        size = shutil.get_terminal_size(fallback=(260, 70))
-        rows = max(5, int(size.lines) - 1)
-        fixed_count = min(5, len(lines))
-        return max(0, len(lines) - fixed_count - rows + 1)
-
-    def clamp_scroll() -> None:
-        nonlocal scroll
-        scroll = max(0, min(scroll, max_scroll_for_current_frame()))
-
     def repaint() -> None:
-        clamp_scroll()
         _paint_frame(last_frame or frame, current_page, paused, scroll=scroll)
 
     try:
@@ -369,7 +287,7 @@ def _stable_stream(cmd: list[str], page: str) -> int:
                     except BlockingIOError:
                         raw_key = ""
 
-                    for ch in _parse_keys(raw_key):
+                    for ch in raw_key:
                         if ch == "1":
                             current_page = "totals"
                             scroll = 0
@@ -382,51 +300,40 @@ def _stable_stream(cmd: list[str], page: str) -> int:
                             current_page = "orders"
                             scroll = 0
                             repaint()
-                        elif str(ch).lower() == "a":
+                        elif ch.lower() == "a":
                             current_page = "all"
                             scroll = 0
                             repaint()
-                        elif ch == "DOWN" or str(ch).lower() == "j":
+                        elif ch.lower() == "j":
                             scroll += 5
                             repaint()
-                        elif ch == "UP" or str(ch).lower() == "k":
+                        elif ch.lower() == "k":
                             scroll = max(0, scroll - 5)
                             repaint()
-                        elif ch == "PAGEDOWN":
+                        elif ch == "\x1b[6~":
                             scroll += 20
                             repaint()
-                        elif ch == "PAGEUP":
+                        elif ch == "\x1b[5~":
                             scroll = max(0, scroll - 20)
                             repaint()
-                        elif ch == "HOME" or str(ch).lower() == "g":
+                        elif ch == "\x1b[H":
                             scroll = 0
-                            repaint()
-                        elif ch == "END":
-                            scroll = max_scroll_for_current_frame()
-                            repaint()
-                        elif str(ch).lower() in {"f", "b"}:
-                            # Engine uses:
-                            #   n = forward / next snapshot
-                            #   b = back / previous snapshot
-                            key_to_engine = "n" if str(ch).lower() == "f" else "b"
-
-                            # Use child PTY only. FIFO path is unreliable here.
-                            # Do not send to both, otherwise it double-steps.
-                            _forward_key_to_child(child_pty_master, key_to_engine)
-
                             repaint()
                         elif ch == " ":
                             paused = not paused
-                            # Do not SIGSTOP the child. Forward pause/resume to engine interactive
-                            # so engine can still process seek keys such as f/b.
-                            _forward_key_to_child(child_pty_master, " ")
+                            if paused:
+                                _send_signal_safe(proc, signal.SIGSTOP)
+                            else:
+                                _send_signal_safe(proc, signal.SIGCONT)
                             repaint()
-                        elif str(ch).lower() == "q":
+                        elif ch.lower() == "q":
                             running = False
                             _send_signal_safe(proc, signal.SIGINT)
                             break
                         else:
-                            _forward_key_to_child(child_pty_master, str(ch))
+                            # Forward all other keys to the engine's own --interactive handler.
+                            # This restores replay forward/back keys such as f/b.
+                            _forward_key_to_child(proc, ch)
 
                 elif key.data == "stdout":
                     try:
@@ -466,6 +373,8 @@ def _stable_stream(cmd: list[str], page: str) -> int:
 
     finally:
         try:
+            if paused:
+                _send_signal_safe(proc, signal.SIGCONT)
             if proc.poll() is None:
                 _send_signal_safe(proc, signal.SIGINT)
                 proc.wait(timeout=1.0)
@@ -479,24 +388,6 @@ def _stable_stream(cmd: list[str], page: str) -> int:
             sel.close()
         except Exception:
             pass
-
-        if control_fd is not None:
-            try:
-                os.close(control_fd)
-            except Exception:
-                pass
-
-        if control_fifo:
-            try:
-                os.unlink(control_fifo)
-            except Exception:
-                pass
-
-        if child_pty_master is not None:
-            try:
-                os.close(child_pty_master)
-            except Exception:
-                pass
 
         _restore_tty(tty_fd, tty_old)
         _safe_write("\033[?25h\033[0m\033[?1049l\n")

@@ -919,12 +919,15 @@ def _pad_visible_no_truncate(s: str, width: int) -> str:
     return s + (" " * pad)
 
 
-def print_columns_full(columns: list[list[str]], col_width: int, gap: str = " ") -> None:
+def print_columns_full(columns: list[list[str]], col_width: int, gap: str = "  ") -> None:
     """
     Print columns without truncating cell content.
 
-    This keeps all ladder fields visible:
-    MYL / Q0 / Q1 / L / P / B / MYB / VOL / MAT.
+    Important:
+    - do NOT treat --col-width 999 as real width;
+    - calculate real width from rendered ladder content;
+    - keep VOL/MAT visible;
+    - keep columns compact.
     """
     if not columns:
         return
@@ -933,7 +936,16 @@ def print_columns_full(columns: list[list[str]], col_width: int, gap: str = " ")
 
     widths: list[int] = []
     for col in columns:
-        w = max([_visible_len_no_ansi(x) for x in col] + [int(col_width)])
+        content_width = max([_visible_len_no_ansi(x) for x in col] + [1])
+
+        # --col-width 999 is used by launch command as "auto/full".
+        # Do not let it create huge empty gaps.
+        requested = int(col_width or 0)
+        if requested <= 0 or requested >= 200:
+            w = content_width
+        else:
+            w = max(content_width, requested)
+
         widths.append(w)
 
     for row_i in range(max_rows):
@@ -942,6 +954,7 @@ def print_columns_full(columns: list[list[str]], col_width: int, gap: str = " ")
             cell = col[row_i] if row_i < len(col) else ""
             parts.append(_pad_visible_no_truncate(cell, widths[col_i]))
         print(gap.join(parts).rstrip())
+
 
 def print_columns(columns: list[list[str]], *, col_width: int = 42, gap: str = "  ") -> None:
     if not columns:
@@ -2808,6 +2821,14 @@ def stream_replay(args: argparse.Namespace) -> int:
         if input_fd is not None:
             try:
                 input_termios_old = termios.tcgetattr(input_fd)
+                control_fd = None
+                control_fifo = os.environ.get("STREEM_REPLAY_CONTROL_FIFO")
+                if control_fifo:
+                    try:
+                        control_fd = os.open(control_fifo, os.O_RDONLY | os.O_NONBLOCK)
+                    except OSError:
+                        control_fd = None
+
                 tty.setraw(input_fd)
             except Exception:
                 input_termios_old = None
@@ -3193,6 +3214,25 @@ def stream_replay(args: argparse.Namespace) -> int:
                                 return
 
                         def _read_key_now() -> str | None:
+                            # Stable wrapper control channel has priority.
+                            if "control_fd" in locals() and control_fd is not None:
+                                if not hasattr(_read_key_now, "_ctrl_buf"):
+                                    setattr(_read_key_now, "_ctrl_buf", "")
+                                ctrl_buf: str = getattr(_read_key_now, "_ctrl_buf")
+                                if ctrl_buf:
+                                    ch, ctrl_buf = ctrl_buf[0], ctrl_buf[1:]
+                                    setattr(_read_key_now, "_ctrl_buf", ctrl_buf)
+                                    return ch
+                                try:
+                                    data = os.read(control_fd, 64)
+                                except (BlockingIOError, InterruptedError, OSError):
+                                    data = b""
+                                if data:
+                                    decoded = data.decode("utf-8", errors="ignore")
+                                    if decoded:
+                                        setattr(_read_key_now, "_ctrl_buf", decoded[1:])
+                                        return decoded[0]
+
                             if input_fd is None:
                                 return None
                             # We read in chunks (not 1 byte) to correctly handle UTF-8 multi-byte keys
@@ -3234,7 +3274,7 @@ def stream_replay(args: argparse.Namespace) -> int:
                                 if not paused:
                                     step_frames = 0
                             # Step controls: make them usable even while running by auto-pausing.
-                            if k in ("n", "N", "т", "Т"):
+                            if k in ("n", "N", "т", "Т", "f", "F", "а", "А"):
                                 paused = True
                                 forced_pause = True
                                 # If we already have a future snapshot (rare), jump to it; else request one-step.
@@ -3270,7 +3310,7 @@ def stream_replay(args: argparse.Namespace) -> int:
                                 paused = False
                                 step_frames = 0
                                 break
-                            if k in ("n", "N", "т", "Т"):
+                            if k in ("n", "N", "т", "Т", "f", "F", "а", "А"):
                                 if history and hist_i < len(history) - 1:
                                     _apply_snap(hist_i + 1)
                                     continue
@@ -3303,6 +3343,12 @@ def stream_replay(args: argparse.Namespace) -> int:
                 fcntl.fcntl(input_fd, fcntl.F_SETFL, input_old_flags)
             except Exception:
                 pass
+        if "control_fd" in locals() and control_fd is not None:
+            try:
+                os.close(control_fd)
+            except OSError:
+                pass
+
         # Close /dev/tty fd if we opened it (don't close stdin).
         if "tty_fd" in locals() and tty_fd is not None:
             try:
