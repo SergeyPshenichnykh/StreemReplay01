@@ -3229,6 +3229,60 @@ def _emit_stable_frame_end() -> None:
 
 
 
+def _set_clean_maker_overlay_before_render(
+    balance: float | None,
+    enabled: bool,
+) -> None:
+    global ENGINE_V2_OVERLAY_LINE
+    global ENGINE_V2_TAPE_LINE
+
+    if not enabled:
+        return
+
+    if not MAKER_UNDER_LAY_GRID_ENABLED:
+        return
+
+    if SIMULATE_ORDERS_ENABLED:
+        return
+
+    base_balance = float(balance or 0.0)
+
+    matched_stake_total = 0.0
+    matched_liability_total = 0.0
+
+    for okey, st in MAKER_UNDER_LAY_GRID_ORDER_STATE.items():
+        try:
+            price = float(okey[3])
+            matched = float(st.get("matched", 0.0) or 0.0)
+        except Exception:
+            continue
+
+        if matched <= 0:
+            continue
+
+        matched_stake_total += matched
+        matched_liability_total += matched * max(0.0, price - 1.0)
+
+    open_liability = float(MAKER_UNDER_LAY_GRID_LIABILITY_TOTAL)
+    locked = open_liability + matched_liability_total
+    free = base_balance - locked
+    pnl_proxy = -matched_liability_total
+
+    ENGINE_V2_OVERLAY_LINE = (
+        f"ENGINE_V2: active=0 next10s=0 "
+        f"locked={locked:.2f} "
+        f"free={free:.2f} "
+        f"pnl_proxy={pnl_proxy:.4f} NEXT=-"
+        f" maker_grid_active={MAKER_UNDER_LAY_GRID_ACTIVE_ORDERS}"
+        + (" maker_matching=ON" if MAKER_UNDER_LAY_GRID_MATCHING_ENABLED else " maker_matching=OFF")
+        + f" maker_matched={matched_stake_total:.2f}"
+        + f" maker_matched_liability={matched_liability_total:.2f}"
+        + f" maker_liability={open_liability:.2f}"
+    )
+    ENGINE_V2_TAPE_LINE = ""
+
+
+
 def stream_replay(args: argparse.Namespace) -> int:
     if not args.replay_file.exists():
         print(f"File not found: {args.replay_file}")
@@ -3613,6 +3667,7 @@ def stream_replay(args: argparse.Namespace) -> int:
                         )
                         print(json.dumps(payload, ensure_ascii=False))
                     else:
+	                        _set_clean_maker_overlay_before_render(balance, bool(getattr(args, "engine_v2_overlay", False)))
 	                        render_dashboard(
 	                            pt=next_frame_pt,
 	                            markets=markets,
@@ -3741,6 +3796,7 @@ def stream_replay(args: argparse.Namespace) -> int:
                                 hist_i = idx
                                 _rebuild_maker_grid_to_history_index(hist_i)
                                 interactive_err = None
+                                _set_clean_maker_overlay_before_render(balance, bool(getattr(args, "engine_v2_overlay", False)))
                                 render_dashboard(
                                     pt=int(s.frame_pt),
                                     markets=markets,
