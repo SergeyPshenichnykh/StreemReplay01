@@ -645,7 +645,7 @@ Latest validated flow:
 
 Regression sample:
 
-```text
+~~~text
 rows: 918
 frames: 608 -> 9868
 negative_slc_rows: 49
@@ -658,7 +658,7 @@ bad_exec: 0
 final_slc_worst: +64.607217
 final_slc_best: +76.307189
 final_slc_ok: True
-```
+~~~
 
 Expected interpretation:
 
