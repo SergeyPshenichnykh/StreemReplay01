@@ -3578,6 +3578,10 @@ SECOND_LEG_CS_DEBUG_STATE: dict[str, object] = {
     "stale_due_pt": None,
     "last_logged_key": None,
     "package_preview": None,
+    "recovery_package_preview": None,
+    "recovery_package_decision_frame": None,
+    "recovery_package_decision_pt": None,
+    "recovery_stale_due_pt": None,
     "package_decision_frame": None,
     "package_decision_pt": None,
     "filled_second_leg_actions": [],
@@ -6882,6 +6886,10 @@ def _second_leg_cs_debug_line(
         state["stale_due_pt"] = now_pt + SECOND_LEG_PLACE_DELAY_MS + SECOND_LEG_STALE_AFTER_PLACE_MS
         state["state"] = "WAITING_PLACE_DELAY"
         state["reason"] = "FIRST_LEG_CHANGED"
+        state["recovery_package_preview"] = None
+        state["recovery_package_decision_frame"] = None
+        state["recovery_package_decision_pt"] = None
+        state["recovery_stale_due_pt"] = None
         reason = "FIRST_LEG_CHANGED"
     else:
         place_due = int(state.get("place_due_pt") or 0)
@@ -7168,6 +7176,27 @@ def _second_leg_cs_debug_line(
                 "actions": [],
             }
         elif maker_recovery_actions:
+            maker_recovery_package = {
+                "mode": "RECOVERY_MAKER_BACK_PACKAGE_SHADOW",
+                "source_mode": recovery_mode,
+                "reason": "pending_recovery_maker_package_frozen",
+                "actions": maker_recovery_actions,
+                "action_count": len(maker_recovery_actions),
+                "capital": round(
+                    sum(float(a.get("stake", 0.0) or 0.0) for a in maker_recovery_actions),
+                    6,
+                ),
+                "full_recovery_capital": round(float(recovery_capital), 6),
+                "full_recovery_worst_if_full": round(float(preview_worst_if_full), 6),
+                "full_recovery_worst_improvement": round(float(preview_worst_improvement), 6),
+                "current_worst": round(float(current_slc_worst), 6),
+            }
+
+            state["recovery_package_preview"] = maker_recovery_package
+            state["recovery_package_decision_frame"] = frame_i
+            state["recovery_package_decision_pt"] = now_pt
+            state["recovery_stale_due_pt"] = now_pt + SECOND_LEG_STALE_AFTER_PLACE_MS
+
             second_leg_recovery_exec = {
                 "status": "WAITING_MAKER_FILL",
                 "reason": "recovery_package_has_maker_fallback_wait_for_queue_model",
@@ -7175,6 +7204,7 @@ def _second_leg_cs_debug_line(
                 "maker_action_count": len(maker_recovery_actions),
                 "taker_action_count": len(raw_recovery_actions) - len(maker_recovery_actions),
                 "capital": round(float(recovery_capital), 6),
+                "maker_package": maker_recovery_package,
                 "actions": raw_recovery_actions,
                 "maker_actions": maker_recovery_actions,
             }
@@ -7528,6 +7558,10 @@ def _second_leg_cs_debug_line(
                 "second_leg_totals_risk_reduction_preview": second_leg_totals_risk_reduction_preview,
                 "second_leg_recovery_preview": second_leg_recovery_preview,
                 "second_leg_recovery_exec": second_leg_recovery_exec,
+                "recovery_package_preview": state.get("recovery_package_preview"),
+                "recovery_package_decision_frame": state.get("recovery_package_decision_frame"),
+                "recovery_package_decision_pt": state.get("recovery_package_decision_pt"),
+                "recovery_stale_due_pt": state.get("recovery_stale_due_pt"),
                 "totals_risk_reduction_exec": totals_risk_reduction_exec,
                 "filled_totals_risk_reduction": _second_leg_compact_totals_risk_reduction_actions(filled_totals_risk_reduction_actions),
                 "totals_greenup_exec": totals_greenup_exec,
