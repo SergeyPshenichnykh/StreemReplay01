@@ -656,6 +656,17 @@ def parse_args() -> argparse.Namespace:
         default="replay/delta_10s_macro_min10/filtered_shadow_bot_v2_no_asian.csv",
         help="CSV with V2 shadow orders.",
     )
+
+    p.add_argument(
+        "--second-leg-cs-debug",
+        action="store_true",
+        help="Read-only SECOND LEG CS package shadow/debug mode. Does not place orders.",
+    )
+    p.add_argument(
+        "--second-leg-debug-jsonl",
+        default="replay/second_leg_debug.jsonl",
+        help="JSONL log for read-only SECOND LEG CS shadow/debug events.",
+    )
     return p.parse_args()
 
 
@@ -3556,10 +3567,3326 @@ def _maker_under_lay_grid_outcome_line(outcome_pnls: dict[int, float]) -> str:
 
 
 
+
+SECOND_LEG_CS_DEBUG_STATE: dict[str, object] = {
+    "epoch": 0,
+    "profile_key": None,
+    "state": "IDLE",
+    "reason": "-",
+    "decision_pt": None,
+    "place_due_pt": None,
+    "stale_due_pt": None,
+    "last_logged_key": None,
+    "package_preview": None,
+    "package_decision_frame": None,
+    "package_decision_pt": None,
+    "filled_second_leg_actions": [],
+    "filled_second_leg_seq": 0,
+    "filled_totals_greenup_actions": [],
+    "filled_totals_greenup_seq": 0,
+    "filled_totals_risk_reduction_actions": [],
+    "filled_totals_risk_reduction_seq": 0,
+}
+
+SECOND_LEG_CS_LAY_MAX_PRICE = 3.5
+SECOND_LEG_CS_RECOVERY_LAY_MAX_PRICE = 3.5
+SECOND_LEG_CS_RECOVERY_MAX_STAKE = 0.25
+SECOND_LEG_CS_RECOVERY_MAX_LIABILITY = 0.50
+SECOND_LEG_CS_RECOVERY_MIN_WORST_IMPROVEMENT = 0.005
+SECOND_LEG_CS_MAKER_LAY_RECOVERY_MAX_PRICE = 3.5
+SECOND_LEG_CS_MAKER_LAY_RECOVERY_MAX_STAKE = 0.25
+SECOND_LEG_CS_MAKER_LAY_RECOVERY_MAX_LIABILITY = 0.50
+SECOND_LEG_CS_MAKER_LAY_RECOVERY_MIN_WORST_IMPROVEMENT = 0.005
+
+SECOND_LEG_CS_TAKER_BACK_RECOVERY_MAX_STAKE = 0.25
+SECOND_LEG_CS_TAKER_BACK_RECOVERY_MIN_WORST_IMPROVEMENT = 0.005
+SECOND_LEG_CS_TAKER_BACK_RECOVERY_MAX_STAKE_LOSS = 0.25
+SECOND_LEG_MAX_CAPITAL_RATIO = 20.0
+SECOND_LEG_PLACE_DELAY_MS = 5000
+SECOND_LEG_REBUILD_DELAY_MS = 10000
+SECOND_LEG_STALE_AFTER_PLACE_MS = 10000
+SECOND_LEG_PREVIEW_MAX_ACTIONS = 8
+SECOND_LEG_PREVIEW_MAX_BACK_STAKE_PER_ACTION = 2.0
+SECOND_LEG_PREVIEW_SAFE_STAKE_HAIRCUT = 0.98
+SECOND_LEG_PREVIEW_WORST_EPS = 0.01
+SECOND_LEG_MAX_SINGLE_PARTIAL_WORST_DROP = 0.25
+SECOND_LEG_MAX_TOTAL_FILLED_WORST_DROP = 0.50
+SECOND_LEG_TOTALS_GREENUP_MIN_GREENUP = 0.005
+SECOND_LEG_TOTALS_GREENUP_MIN_WORST_IMPROVEMENT = 0.005
+SECOND_LEG_TOTALS_GREENUP_MIN_EXEC_STAKE = 0.01
+
+SECOND_LEG_TOTALS_RISK_REDUCTION_MIN_WORST_IMPROVEMENT = 0.10
+SECOND_LEG_TOTALS_RISK_REDUCTION_MAX_COST = 1.00
+SECOND_LEG_TOTALS_RISK_REDUCTION_MIN_IMPROVEMENT_PER_COST = 0.25
+SECOND_LEG_TOTALS_RISK_REDUCTION_MAX_STAKE = 25.00
+SECOND_LEG_TOTALS_RISK_REDUCTION_MAX_TOTAL_COST = 2.00
+
+
+def _second_leg_score_goals(name: str | None) -> int | None:
+    if not name:
+        return None
+    m = re.match(r"^\s*(\d+)\s*-\s*(\d+)\s*$", str(name))
+    if not m:
+        return None
+    return int(m.group(1)) + int(m.group(2))
+
+
+def _second_leg_runner_buckets(name: str | None, goal_bucket: int | None = None) -> list[str]:
+    if goal_bucket is None:
+        goal_bucket = _second_leg_score_goals(name)
+
+    if goal_bucket is not None:
+        g = int(goal_bucket)
+        return ["G9+" if g >= 9 else f"G{g}"]
+
+    low = (name or "").lower()
+
+    if "any other home win" in low:
+        return ["G4", "G5", "G6", "G7", "G8", "G9+"]
+
+    if "any other away win" in low:
+        return ["G4", "G5", "G6", "G7", "G8", "G9+"]
+
+    if "any other draw" in low:
+        return ["G8", "G9+"]
+
+    return []
+
+
+def _second_leg_cs_shadow_summary(
+    markets: dict[str, MarketState] | None,
+) -> dict[str, object]:
+    markets = markets or {}
+
+    runners = 0
+    two_sided = 0
+    one_sided = 0
+    maker_back_candidates = 0
+    taker_back_candidates = 0
+    safe_lay_candidates = 0
+    any_other = 0
+
+    sample: list[dict[str, object]] = []
+
+    for st in markets.values():
+        if st is None:
+            continue
+        if not is_correct_score(st):
+            continue
+
+        for r in st.runners.values():
+            runners += 1
+            name = r.name or str(r.selection_id)
+            low = name.lower()
+
+            if "any other" in low:
+                any_other += 1
+
+            bb = best_level(r.available_to_back, side="BACK")
+            bl = best_level(r.available_to_lay, side="LAY")
+
+            has_bb = bool(bb is not None and float(bb[1]) > 0)
+            has_bl = bool(bl is not None and float(bl[1]) > 0)
+
+            if has_bb and has_bl:
+                two_sided += 1
+            elif has_bb or has_bl:
+                one_sided += 1
+
+            if has_bb:
+                maker_back_candidates += 1
+
+            if has_bl:
+                taker_back_candidates += 1
+
+            if has_bb and float(bb[0]) <= SECOND_LEG_CS_LAY_MAX_PRICE:
+                safe_lay_candidates += 1
+
+            if len(sample) < 8:
+                goals = _second_leg_score_goals(name)
+                sample.append(
+                    {
+                        "runner": name,
+                        "buckets": _second_leg_runner_buckets(name, goals),
+                        "bb": None if bb is None else [float(bb[0]), float(bb[1])],
+                        "bl": None if bl is None else [float(bl[0]), float(bl[1])],
+                    }
+                )
+
+    return {
+        "runners": runners,
+        "two_sided": two_sided,
+        "one_sided": one_sided,
+        "maker_back_candidates": maker_back_candidates,
+        "taker_back_candidates": taker_back_candidates,
+        "safe_lay_candidates": safe_lay_candidates,
+        "any_other": any_other,
+        "sample": sample,
+    }
+
+
+
+def _second_leg_bucket_label_from_goals(goals: int) -> str:
+    return "G9+" if int(goals) >= 9 else f"G{int(goals)}"
+
+
+def _second_leg_outcome_bucket_map(outcome_pnls: dict[int, float]) -> dict[str, float]:
+    out: dict[str, float] = {}
+    if not outcome_pnls:
+        return out
+
+    max_goals = max(int(k) for k in outcome_pnls)
+    for goals, val in sorted(outcome_pnls.items()):
+        label = f"G{int(goals)}" if int(goals) < max_goals else f"G{int(goals)}+"
+        out[label] = float(val)
+
+    return out
+
+
+def _second_leg_cs_virtual_rows(
+    markets: dict[str, MarketState] | None,
+) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+
+    for st in (markets or {}).values():
+        if st is None:
+            continue
+        if not is_correct_score(st):
+            continue
+
+        for r in st.runners.values():
+            name = r.name or str(r.selection_id)
+            goals = _second_leg_score_goals(name)
+            buckets = _second_leg_runner_buckets(name, goals)
+
+            if not buckets:
+                continue
+
+            bb = best_level(r.available_to_back, side="BACK")
+            bl = best_level(r.available_to_lay, side="LAY")
+
+            kind = "exact_score" if goals is not None else "any_other"
+
+            rows.append(
+                {
+                    "market_id": str(st.market_id),
+                    "selection_id": int(r.selection_id),
+                    "runner": name,
+                    "kind": kind,
+                    "buckets": buckets,
+                    "bb_price": None if bb is None else float(bb[0]),
+                    "bb_size": None if bb is None else float(bb[1]),
+                    "bl_price": None if bl is None else float(bl[0]),
+                    "bl_size": None if bl is None else float(bl[1]),
+                }
+            )
+
+    return rows
+
+
+def _second_leg_apply_back_preview(
+    *,
+    virtual_rows: list[dict[str, object]],
+    base_bucket: dict[str, float],
+    package: list[dict[str, object]],
+) -> dict[str, float]:
+    # Build virtual profile from current bucket profile.
+    virtual_profile: list[dict[str, object]] = []
+
+    for row in virtual_rows:
+        buckets = list(row.get("buckets") or [])
+        if not buckets:
+            continue
+
+        # For Any Other mapped to multiple buckets, keep one virtual row per bucket.
+        for bucket in buckets:
+            virtual_profile.append(
+                {
+                    "runner": str(row["runner"]),
+                    "bucket": str(bucket),
+                    "value": float(base_bucket.get(str(bucket), 0.0)),
+                }
+            )
+
+    for action in package:
+        runner = str(action["runner"])
+        price = float(action["price"])
+        stake = float(action["stake"])
+
+        for vr in virtual_profile:
+            if str(vr["runner"]) == runner:
+                vr["value"] = float(vr["value"]) + (price - 1.0) * stake
+            else:
+                vr["value"] = float(vr["value"]) - stake
+
+    by_bucket: dict[str, list[float]] = {}
+    for vr in virtual_profile:
+        by_bucket.setdefault(str(vr["bucket"]), []).append(float(vr["value"]))
+
+    out: dict[str, float] = {}
+    for bucket in ["G0", "G1", "G2", "G3", "G4", "G5", "G6", "G7", "G8", "G9+"]:
+        vals = by_bucket.get(bucket) or []
+        out[bucket] = min(vals) if vals else float(base_bucket.get(bucket, 0.0))
+
+    return out
+
+
+def _second_leg_candidate_package_preview(
+    *,
+    markets: dict[str, MarketState] | None,
+    outcome_pnls: dict[int, float],
+    filled_second_leg_actions: list[dict[str, object]] | None = None,
+    filled_totals_greenup_actions: list[dict[str, object]] | None = None,
+    filled_totals_risk_reduction_actions: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    """
+    Read-only virtual-outcome MAKER BACK package validator.
+
+    This does NOT place orders and does NOT modify order_model.
+
+    Important:
+      - bucket coverage is NOT enough
+      - G1 means both 0-1 and 1-0
+      - G2 means 0-2, 1-1, 2-0
+      - Any Other runners are split into virtual bucket rows
+      - package is rejected if any critical virtual outcome is uncovered
+      - package is rejected if maker-back dutch condition is infeasible
+
+    Current shadow rule:
+      accept maker-back preview only if it can be filled without worsening current worst-case.
+    """
+    first_leg_bucket = _second_leg_outcome_bucket_map(outcome_pnls)
+    base_bucket = dict(first_leg_bucket)
+
+    # Conservative combined profile:
+    # FIRST LEG + filled TOTALS GREENUP + already filled SECOND LEG BACK actions.
+    filled_totals_greenup_actions = list(filled_totals_greenup_actions or [])
+    if base_bucket and filled_totals_greenup_actions:
+        base_bucket = _second_leg_apply_totals_back_actions(
+            base_bucket=base_bucket,
+            actions=filled_totals_greenup_actions,
+        )
+
+    filled_totals_risk_reduction_actions = list(filled_totals_risk_reduction_actions or [])
+    if base_bucket and filled_totals_risk_reduction_actions:
+        base_bucket = _second_leg_apply_totals_back_actions(
+            base_bucket=base_bucket,
+            actions=filled_totals_risk_reduction_actions,
+        )
+
+    filled_second_leg_actions = list(filled_second_leg_actions or [])
+    if base_bucket and filled_second_leg_actions:
+        base_bucket = _second_leg_apply_back_preview(
+            virtual_rows=_second_leg_cs_virtual_rows(markets),
+            base_bucket=base_bucket,
+            package=filled_second_leg_actions,
+        )
+
+    total_worst_drop = 0.0
+
+    if first_leg_bucket and base_bucket and filled_second_leg_actions:
+        first_leg_worst = min(float(v) for v in first_leg_bucket.values())
+        combined_worst = min(float(v) for v in base_bucket.values())
+        total_worst_drop = float(first_leg_worst) - float(combined_worst)
+
+        if total_worst_drop > SECOND_LEG_MAX_TOTAL_FILLED_WORST_DROP + SECOND_LEG_PREVIEW_WORST_EPS:
+            return {
+                "mode": "NO_SAFE_MAKER_BACK_PACKAGE",
+                "reason": "total_filled_worst_drop_guard",
+                "actions": [],
+                "action_count": 0,
+                "capital": 0.0,
+                "worst": round(float(combined_worst), 6),
+                "worst_if_full": round(float(combined_worst), 6),
+                "best_if_full": round(max(float(v) for v in base_bucket.values()), 6),
+                "profile_if_full": {k: round(float(v), 6) for k, v in base_bucket.items()},
+                "first_leg_worst": round(float(first_leg_worst), 6),
+                "combined_worst": round(float(combined_worst), 6),
+                "total_worst_drop": round(float(total_worst_drop), 6),
+                "max_total_filled_worst_drop": round(float(SECOND_LEG_MAX_TOTAL_FILLED_WORST_DROP), 6),
+                "filled_second_leg_count": len(filled_second_leg_actions),
+                "filled_second_leg_stake": round(sum(float(x.get("stake", 0.0) or 0.0) for x in filled_second_leg_actions), 6),
+            }
+
+    remaining_total_worst_budget = max(
+        0.0,
+        float(SECOND_LEG_MAX_TOTAL_FILLED_WORST_DROP) - max(0.0, float(total_worst_drop)),
+    )
+    effective_single_partial_worst_drop = min(
+        float(SECOND_LEG_MAX_SINGLE_PARTIAL_WORST_DROP),
+        float(remaining_total_worst_budget),
+    )
+
+    if filled_second_leg_actions and effective_single_partial_worst_drop <= SECOND_LEG_PREVIEW_WORST_EPS:
+        current_worst = min(float(v) for v in base_bucket.values()) if base_bucket else 0.0
+        return {
+            "mode": "NO_SAFE_MAKER_BACK_PACKAGE",
+            "reason": "total_filled_worst_budget_exhausted",
+            "actions": [],
+            "action_count": 0,
+            "capital": 0.0,
+            "worst": round(float(current_worst), 6),
+            "worst_if_full": round(float(current_worst), 6),
+            "best_if_full": round(max(float(v) for v in base_bucket.values()), 6) if base_bucket else 0.0,
+            "profile_if_full": {k: round(float(v), 6) for k, v in base_bucket.items()},
+            "total_worst_drop": round(float(total_worst_drop), 6),
+            "remaining_total_worst_budget": round(float(remaining_total_worst_budget), 6),
+            "effective_single_partial_worst_drop": round(float(effective_single_partial_worst_drop), 6),
+            "max_total_filled_worst_drop": round(float(SECOND_LEG_MAX_TOTAL_FILLED_WORST_DROP), 6),
+            "filled_second_leg_count": len(filled_second_leg_actions),
+            "filled_second_leg_stake": round(sum(float(x.get("stake", 0.0) or 0.0) for x in filled_second_leg_actions), 6),
+        }
+
+    if not base_bucket:
+        return {
+            "mode": "IDLE",
+            "reason": "no_outcome",
+            "actions": [],
+            "action_count": 0,
+            "capital": 0.0,
+        }
+
+    worst = min(float(v) for v in base_bucket.values())
+    best = max(float(v) for v in base_bucket.values())
+
+    if worst >= 0:
+        return {
+            "mode": "CLOSED",
+            "reason": "profile_non_negative",
+            "actions": [],
+            "action_count": 0,
+            "capital": 0.0,
+            "worst": round(worst, 6),
+            "worst_if_full": round(worst, 6),
+            "best_if_full": round(best, 6),
+            "profile_if_full": {k: round(v, 6) for k, v in base_bucket.items()},
+        }
+
+    residual_abs = abs(float(worst))
+    max_capital = residual_abs * SECOND_LEG_MAX_CAPITAL_RATIO
+
+    source_rows = _second_leg_cs_virtual_rows(markets)
+
+    virtual_rows: list[dict[str, object]] = []
+    for row in source_rows:
+        buckets = list(row.get("buckets") or [])
+        for bucket in buckets:
+            bucket_s = str(bucket)
+            virtual_rows.append(
+                {
+                    "runner": str(row.get("runner")),
+                    "bucket": bucket_s,
+                    "kind": str(row.get("kind") or ""),
+                    "base": float(base_bucket.get(bucket_s, 0.0)),
+                    "bb_price": row.get("bb_price"),
+                    "bb_size": row.get("bb_size"),
+                    "bl_price": row.get("bl_price"),
+                    "bl_size": row.get("bl_size"),
+                }
+            )
+
+    # Critical rows are the exact virtual outcomes currently equal to worst-case.
+    # If any of them is unbacked while total BACK stake > 0, worst-case worsens.
+    critical_rows = [
+        r for r in virtual_rows
+        if float(r["base"]) <= float(worst) + 1e-9
+    ]
+
+    critical_by_bucket: dict[str, int] = {}
+    for r in critical_rows:
+        critical_by_bucket[str(r["bucket"])] = critical_by_bucket.get(str(r["bucket"]), 0) + 1
+
+    missing: list[dict[str, object]] = []
+    selected_by_runner: dict[str, dict[str, object]] = {}
+
+    for r in critical_rows:
+        runner = str(r["runner"])
+        price = r.get("bb_price")
+
+        if price is None or float(price) <= 1.0:
+            missing.append(
+                {
+                    "runner": runner,
+                    "bucket": str(r["bucket"]),
+                    "reason": "missing_maker_back_price",
+                }
+            )
+            continue
+
+        # One BACK order on an Any Other runner covers all its virtual bucket rows.
+        if runner not in selected_by_runner:
+            selected_by_runner[runner] = {
+                "mode": "MAKER",
+                "side": "BACK",
+                "runner": runner,
+                "price": float(price),
+                "queue": 0.0 if r.get("bb_size") is None else float(r.get("bb_size") or 0.0),
+                "buckets": set(),
+                "critical_buckets": set(),
+                "kind": str(r.get("kind") or ""),
+            }
+
+        selected_by_runner[runner]["buckets"].add(str(r["bucket"]))
+        selected_by_runner[runner]["critical_buckets"].add(str(r["bucket"]))
+
+    inverse_sum = 0.0
+    for x in selected_by_runner.values():
+        inverse_sum += 1.0 / max(1e-12, float(x["price"]))
+
+    # MAKER BACK only can preserve current worst only if sum(1/price) < 1.
+    # If >= 1, the minimum required stakes on critical runners exceed total stake.
+    if missing or inverse_sum >= 1.0:
+        reason = "critical_virtual_outcomes_missing_maker_back" if missing else "maker_back_dutch_infeasible"
+
+        return {
+            "mode": "NO_SAFE_MAKER_BACK_PACKAGE",
+            "reason": reason,
+            "actions": [],
+            "action_count": 0,
+            "capital": 0.0,
+            "max_capital": round(max_capital, 6),
+            "worst": round(worst, 6),
+            "worst_if_full": round(worst, 6),
+            "best_if_full": round(best, 6),
+            "profile_if_full": {k: round(v, 6) for k, v in base_bucket.items()},
+            "virtual_row_count": len(virtual_rows),
+            "critical_virtual_row_count": len(critical_rows),
+            "critical_by_bucket": dict(sorted(critical_by_bucket.items())),
+            "maker_back_runner_count": len(selected_by_runner),
+            "maker_back_inverse_sum": round(inverse_sum, 6),
+            "missing": missing[:20],
+            "diagnostic": {
+                "rule": "virtual_outcome_maker_back_validator",
+                "explain": "Every critical virtual outcome must be covered. Maker BACK is feasible only if sum(1 / maker_price) < 1.",
+            },
+        }
+
+    # If we ever get here, maker-back-only is mathematically feasible for
+    # preserving current worst-case. Build a tiny safe shadow package.
+    # This branch is expected to be rare.
+    non_selected_buffer = None
+    selected_runners = set(selected_by_runner.keys())
+
+    for r in virtual_rows:
+        if str(r["runner"]) in selected_runners:
+            continue
+
+        buffer = float(r["base"]) - float(worst)
+        if buffer <= 0:
+            non_selected_buffer = 0.0 if non_selected_buffer is None else min(non_selected_buffer, 0.0)
+        else:
+            non_selected_buffer = buffer if non_selected_buffer is None else min(non_selected_buffer, buffer)
+
+    if non_selected_buffer is None:
+        non_selected_buffer = residual_abs
+
+    total_stake = min(
+        residual_abs,
+        max_capital,
+        float(non_selected_buffer),
+    )
+
+    # Shadow preview safety:
+    # keep a tiny buffer so rounding/printing precision does not create
+    # artificial REJECTED_WORSE_PROFILE when mathematically the package
+    # only preserves the current worst-case.
+    total_stake *= SECOND_LEG_PREVIEW_SAFE_STAKE_HAIRCUT
+
+    if total_stake <= 1e-9:
+        return {
+            "mode": "NO_SAFE_MAKER_BACK_PACKAGE",
+            "reason": "no_positive_safe_stake_size",
+            "actions": [],
+            "action_count": 0,
+            "capital": 0.0,
+            "max_capital": round(max_capital, 6),
+            "worst": round(worst, 6),
+            "worst_if_full": round(worst, 6),
+            "best_if_full": round(best, 6),
+            "profile_if_full": {k: round(v, 6) for k, v in base_bucket.items()},
+            "virtual_row_count": len(virtual_rows),
+            "critical_virtual_row_count": len(critical_rows),
+            "critical_by_bucket": dict(sorted(critical_by_bucket.items())),
+            "maker_back_runner_count": len(selected_by_runner),
+            "maker_back_inverse_sum": round(inverse_sum, 6),
+        }
+
+    actions: list[dict[str, object]] = []
+    min_total = 0.0
+
+    # Minimum stake per runner to avoid worsening critical rows:
+    # price * stake >= total_stake
+    for runner, x in selected_by_runner.items():
+        price = float(x["price"])
+        stake = total_stake / price
+        min_total += stake
+
+        actions.append(
+            {
+                "mode": "MAKER",
+                "side": "BACK",
+                "runner": runner,
+                "buckets": sorted(str(b) for b in x["buckets"]),
+                "critical_buckets": sorted(str(b) for b in x["critical_buckets"]),
+                "price": round(price, 6),
+                "stake": round(stake, 6),
+                "queue": round(float(x["queue"]), 6),
+                "capital": round(stake, 6),
+            }
+        )
+
+    # Allocate the small leftover to the best-price runner.
+    leftover = max(0.0, total_stake - min_total)
+    if leftover > 1e-9 and actions:
+        best_i = max(range(len(actions)), key=lambda i: float(actions[i]["price"]))
+        actions[best_i]["stake"] = round(float(actions[best_i]["stake"]) + leftover, 6)
+        actions[best_i]["capital"] = round(float(actions[best_i]["capital"]) + leftover, 6)
+
+    profile_if_full = _second_leg_apply_back_preview(
+        virtual_rows=source_rows,
+        base_bucket=base_bucket,
+        package=actions,
+    )
+
+    worst_if_full = min(profile_if_full.values()) if profile_if_full else worst
+    best_if_full = max(profile_if_full.values()) if profile_if_full else best
+
+    # Maker packages are NOT atomic.
+    # Stress every possible single-action partial fill.
+    # If one isolated fill worsens current worst-case, the package is unsafe,
+    # because live matching may fill exactly that one order first.
+    partial_fill_tests: list[dict[str, object]] = []
+    partial_worst_min = float(worst)
+
+    for action in actions:
+        single_profile = _second_leg_apply_back_preview(
+            virtual_rows=source_rows,
+            base_bucket=base_bucket,
+            package=[action],
+        )
+        single_worst = min(single_profile.values()) if single_profile else float(worst)
+        partial_worst_min = min(partial_worst_min, float(single_worst))
+
+        partial_fill_tests.append(
+            {
+                "runner": action.get("runner"),
+                "side": action.get("side"),
+                "mode": action.get("mode"),
+                "price": action.get("price"),
+                "stake": action.get("stake"),
+                "worst_if_single_fill": round(float(single_worst), 6),
+            }
+        )
+
+    if float(partial_worst_min) < float(worst) - SECOND_LEG_PREVIEW_WORST_EPS:
+        observed_drop = float(worst) - float(partial_worst_min)
+
+        if observed_drop > 0:
+            scale = min(1.0, effective_single_partial_worst_drop / observed_drop)
+        else:
+            scale = 1.0
+
+        micro_actions: list[dict[str, object]] = []
+        for action in actions:
+            a = dict(action)
+            old_stake = float(a.get("stake", 0.0) or 0.0)
+            new_stake = old_stake * scale
+            if new_stake <= 1e-9:
+                continue
+            a["stake"] = round(new_stake, 6)
+            a["capital"] = round(new_stake, 6)
+            micro_actions.append(a)
+
+        micro_profile_if_full = _second_leg_apply_back_preview(
+            virtual_rows=source_rows,
+            base_bucket=base_bucket,
+            package=micro_actions,
+        )
+        micro_worst_if_full = min(micro_profile_if_full.values()) if micro_profile_if_full else worst
+        micro_best_if_full = max(micro_profile_if_full.values()) if micro_profile_if_full else best
+
+        micro_partial_tests: list[dict[str, object]] = []
+        micro_partial_worst_min = float(worst)
+
+        for action in micro_actions:
+            single_profile = _second_leg_apply_back_preview(
+                virtual_rows=source_rows,
+                base_bucket=base_bucket,
+                package=[action],
+            )
+            single_worst = min(single_profile.values()) if single_profile else float(worst)
+            micro_partial_worst_min = min(micro_partial_worst_min, float(single_worst))
+            micro_partial_tests.append(
+                {
+                    "runner": action.get("runner"),
+                    "side": action.get("side"),
+                    "mode": action.get("mode"),
+                    "price": action.get("price"),
+                    "stake": action.get("stake"),
+                    "worst_if_single_fill": round(float(single_worst), 6),
+                }
+            )
+
+        if float(micro_partial_worst_min) < float(worst) - effective_single_partial_worst_drop - SECOND_LEG_PREVIEW_WORST_EPS:
+            return {
+                "mode": "REJECTED_PARTIAL_FILL_UNSAFE",
+                "reason": "micro_scale_failed_partial_worst_guard",
+                "rejected_actions": actions,
+                "actions": [],
+                "action_count": 0,
+                "capital": 0.0,
+                "rejected_capital": round(sum(float(a.get("capital", 0.0)) for a in actions), 6),
+                "max_capital": round(max_capital, 6),
+                "worst": round(worst, 6),
+                "worst_if_full": round(float(worst_if_full), 6),
+                "partial_worst_min": round(float(partial_worst_min), 6),
+                "micro_partial_worst_min": round(float(micro_partial_worst_min), 6),
+                "effective_single_partial_worst_drop": round(float(effective_single_partial_worst_drop), 6),
+                "remaining_total_worst_budget": round(float(remaining_total_worst_budget), 6),
+                "total_worst_drop": round(float(total_worst_drop), 6),
+                "best_if_full": round(float(best_if_full), 6),
+                "profile_if_full": {k: round(v, 6) for k, v in profile_if_full.items()},
+                "virtual_row_count": len(virtual_rows),
+                "critical_virtual_row_count": len(critical_rows),
+                "critical_by_bucket": dict(sorted(critical_by_bucket.items())),
+                "maker_back_runner_count": len(selected_by_runner),
+                "maker_back_inverse_sum": round(inverse_sum, 6),
+                "partial_fill_tests": partial_fill_tests[:20],
+                "micro_partial_fill_tests": micro_partial_tests[:20],
+            }
+
+        return {
+            "mode": "MAKER_BACK_MICRO_PREVIEW",
+            "reason": "scaled_to_single_partial_worst_guard",
+            "actions": micro_actions,
+            "action_count": len(micro_actions),
+            "capital": round(sum(float(a.get("capital", 0.0)) for a in micro_actions), 6),
+            "max_capital": round(max_capital, 6),
+            "worst": round(worst, 6),
+            "worst_if_full": round(float(micro_worst_if_full), 6),
+            "best_if_full": round(float(micro_best_if_full), 6),
+            "partial_worst_min": round(float(micro_partial_worst_min), 6),
+            "max_single_partial_worst_drop": round(float(effective_single_partial_worst_drop), 6),
+            "configured_max_single_partial_worst_drop": round(float(SECOND_LEG_MAX_SINGLE_PARTIAL_WORST_DROP), 6),
+            "remaining_total_worst_budget": round(float(remaining_total_worst_budget), 6),
+            "total_worst_drop": round(float(total_worst_drop), 6),
+            "scale_from_full_package": round(float(scale), 6),
+            "full_package_rejected_capital": round(sum(float(a.get("capital", 0.0)) for a in actions), 6),
+            "profile_if_full": {k: round(v, 6) for k, v in micro_profile_if_full.items()},
+            "virtual_row_count": len(virtual_rows),
+            "critical_virtual_row_count": len(critical_rows),
+            "critical_by_bucket": dict(sorted(critical_by_bucket.items())),
+            "maker_back_runner_count": len(selected_by_runner),
+            "maker_back_inverse_sum": round(inverse_sum, 6),
+            "partial_fill_tests": micro_partial_tests[:20],
+        }
+
+    if float(worst_if_full) < float(worst) - SECOND_LEG_PREVIEW_WORST_EPS:
+        return {
+            "mode": "REJECTED_WORSE_PROFILE",
+            "reason": "virtual_outcome_validation_failed_after_stake_build",
+            "rejected_actions": actions,
+            "actions": [],
+            "action_count": 0,
+            "capital": 0.0,
+            "rejected_capital": round(sum(float(a.get("capital", 0.0)) for a in actions), 6),
+            "max_capital": round(max_capital, 6),
+            "worst": round(worst, 6),
+            "worst_if_full": round(float(worst_if_full), 6),
+            "best_if_full": round(float(best_if_full), 6),
+            "profile_if_full": {k: round(v, 6) for k, v in profile_if_full.items()},
+            "virtual_row_count": len(virtual_rows),
+            "critical_virtual_row_count": len(critical_rows),
+            "critical_by_bucket": dict(sorted(critical_by_bucket.items())),
+            "maker_back_runner_count": len(selected_by_runner),
+            "maker_back_inverse_sum": round(inverse_sum, 6),
+        }
+
+    return {
+        "mode": "MAKER_BACK_VIRTUAL_PREVIEW",
+        "reason": "virtual_outcome_maker_back_feasible_shadow",
+        "actions": actions,
+        "action_count": len(actions),
+        "capital": round(sum(float(a.get("capital", 0.0)) for a in actions), 6),
+        "max_capital": round(max_capital, 6),
+        "worst": round(worst, 6),
+        "worst_if_full": round(float(worst_if_full), 6),
+        "best_if_full": round(float(best_if_full), 6),
+        "profile_if_full": {k: round(v, 6) for k, v in profile_if_full.items()},
+        "virtual_row_count": len(virtual_rows),
+        "critical_virtual_row_count": len(critical_rows),
+        "critical_by_bucket": dict(sorted(critical_by_bucket.items())),
+        "maker_back_runner_count": len(selected_by_runner),
+        "maker_back_inverse_sum": round(inverse_sum, 6),
+    }
+
+def _second_leg_profile_key(outcome_pnls: dict[int, float]) -> tuple[float, ...]:
+    return tuple(round(float(outcome_pnls.get(i, 0.0)), 6) for i in range(10))
+
+
+
+
+
+
+def _second_leg_combined_bucket_profile(
+    *,
+    markets: dict[str, MarketState] | None,
+    outcome_pnls: dict[int, float],
+    filled_second_leg_actions: list[dict[str, object]] | None,
+    filled_totals_greenup_actions: list[dict[str, object]] | None = None,
+    filled_totals_risk_reduction_actions: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    base_bucket = _second_leg_outcome_bucket_map(outcome_pnls)
+    filled = list(filled_second_leg_actions or [])
+    filled_totals = list(filled_totals_greenup_actions or [])
+    filled_trr = list(filled_totals_risk_reduction_actions or [])
+
+    if not base_bucket:
+        return {
+            "ok": False,
+            "reason": "no_base_bucket",
+            "profile": {},
+            "worst": None,
+            "best": None,
+        }
+
+    combined = dict(base_bucket)
+
+    if filled_totals:
+        combined = _second_leg_apply_totals_back_actions(
+            base_bucket=combined,
+            actions=filled_totals,
+        )
+
+    if filled_trr:
+        combined = _second_leg_apply_totals_back_actions(
+            base_bucket=combined,
+            actions=filled_trr,
+        )
+
+    if filled:
+        combined = _second_leg_apply_back_preview(
+            virtual_rows=_second_leg_cs_virtual_rows(markets),
+            base_bucket=combined,
+            package=filled,
+        )
+
+    worst = min(float(v) for v in combined.values()) if combined else None
+    best = max(float(v) for v in combined.values()) if combined else None
+
+    base_worst = min(float(v) for v in base_bucket.values()) if base_bucket else None
+    base_best = max(float(v) for v in base_bucket.values()) if base_bucket else None
+
+    worst_drop = None
+    if worst is not None and base_worst is not None:
+        worst_drop = float(base_worst) - float(worst)
+
+    return {
+        "ok": True,
+        "reason": "first_leg_plus_filled_second_leg" if filled else "first_leg_only",
+        "filled_count": len(filled),
+        "filled_stake": round(sum(float(x.get("stake", 0.0) or 0.0) for x in filled), 6),
+        "filled_totals_greenup_count": len(filled_totals),
+        "filled_totals_greenup_stake": round(sum(float(x.get("stake", 0.0) or 0.0) for x in filled_totals), 6),
+        "filled_totals_greenup_greenup": round(sum(float(x.get("greenup", 0.0) or 0.0) for x in filled_totals), 6),
+        "filled_totals_risk_reduction_count": len(filled_trr),
+        "filled_totals_risk_reduction_stake": round(sum(float(x.get("stake", 0.0) or 0.0) for x in filled_trr), 6),
+        "filled_totals_risk_reduction_cost": round(sum(float(x.get("cost", 0.0) or 0.0) for x in filled_trr), 6),
+        "worst": None if worst is None else round(float(worst), 6),
+        "best": None if best is None else round(float(best), 6),
+        "base_worst": None if base_worst is None else round(float(base_worst), 6),
+        "base_best": None if base_best is None else round(float(base_best), 6),
+        "worst_drop_from_first_leg": None if worst_drop is None else round(float(worst_drop), 6),
+        "max_total_filled_worst_drop": round(float(SECOND_LEG_MAX_TOTAL_FILLED_WORST_DROP), 6),
+        "profile": {k: round(float(v), 6) for k, v in combined.items()},
+        "base_profile": {k: round(float(v), 6) for k, v in base_bucket.items()},
+    }
+
+
+
+def _second_leg_bucket_goal_number(bucket: str) -> int:
+    b = str(bucket)
+    if b == "G9+":
+        return 9
+    if b.startswith("G"):
+        try:
+            return int(b[1:])
+        except Exception:
+            return 9
+    return 9
+
+
+def _second_leg_apply_totals_back_preview(
+    *,
+    base_bucket: dict[str, float],
+    line: float,
+    price: float,
+    stake: float,
+) -> dict[str, float]:
+    """
+    Preview BACK on Under line at given price/stake.
+
+    If final goals < line:
+      BACK wins stake * (price - 1)
+    Else:
+      BACK loses stake
+    """
+    out = dict(base_bucket)
+
+    for bucket in list(out.keys()):
+        goals = _second_leg_bucket_goal_number(bucket)
+        if float(goals) < float(line):
+            out[bucket] = float(out[bucket]) + float(stake) * (float(price) - 1.0)
+        else:
+            out[bucket] = float(out[bucket]) - float(stake)
+
+    return out
+
+
+def _second_leg_totals_under_runner_for_market(
+    market: MarketState,
+    selection_id: int | None = None,
+    handicap: float | None = None,
+) -> RunnerState | None:
+    if market is None:
+        return None
+
+    # Prefer exact selection/handicap from maker order key.
+    for r in market.runners.values():
+        try:
+            if selection_id is not None and int(r.selection_id) != int(selection_id):
+                continue
+            if handicap is not None and abs(float(r.handicap or 0.0) - float(handicap or 0.0)) > 1e-9:
+                continue
+            return r
+        except Exception:
+            continue
+
+    # Fallback: Under runner by name.
+    for r in market.runners.values():
+        name = str(r.name or "")
+        if name.lower().startswith("under "):
+            return r
+
+    return None
+
+
+def _second_leg_totals_greenup_preview(
+    *,
+    markets: dict[str, MarketState] | None,
+    second_leg_combined_profile: dict[str, object],
+    filled_totals_greenup_actions: list[dict[str, object]] | None = None,
+    filled_totals_risk_reduction_actions: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    """
+    Read-only totals greenup preview v0.
+
+    Priority use-case:
+      - goal / dangerous move / totals shock
+      - current UNDER LAY first-leg can be closed by BACK taker
+      - show candidates that either:
+          a) have positive line greenup
+          b) improve current SLC worst
+
+    Does NOT place orders.
+    Does NOT mutate maker state.
+    """
+    profile = second_leg_combined_profile.get("profile")
+    if not isinstance(profile, dict) or not profile:
+        return {
+            "mode": "NO_TOTALS_GREENUP",
+            "reason": "missing_combined_profile",
+            "actions": [],
+            "action_count": 0,
+        }
+
+    base_bucket = {str(k): float(v) for k, v in profile.items()}
+    current_worst = min(base_bucket.values())
+    current_best = max(base_bucket.values())
+
+    if not MAKER_UNDER_LAY_GRID_ENABLED or not MAKER_UNDER_LAY_GRID_MATCHING_ENABLED:
+        return {
+            "mode": "NO_TOTALS_GREENUP",
+            "reason": "maker_under_lay_grid_not_active",
+            "actions": [],
+            "action_count": 0,
+            "current_worst": round(float(current_worst), 6),
+            "current_best": round(float(current_best), 6),
+        }
+
+    markets = markets or {}
+
+    try:
+        visible_market_ids = _maker_under_lay_grid_canonical_totals_market_ids(markets)
+    except Exception:
+        visible_market_ids = set(str(k) for k in markets.keys())
+
+    grouped: dict[tuple[str, int, float], dict[str, float]] = {}
+
+    filled_totals_by_key = _second_leg_totals_back_stake_by_key(
+        filled_totals_greenup_actions,
+        filled_totals_risk_reduction_actions,
+    )
+
+    for okey, st in MAKER_UNDER_LAY_GRID_ORDER_STATE.items():
+        try:
+            market_id, selection_id, handicap, lay_price = okey
+            market_id_s = str(market_id)
+
+            if visible_market_ids and market_id_s not in visible_market_ids:
+                continue
+
+            matched = float(st.get("matched", 0.0) or 0.0)
+            if matched <= 1e-9:
+                continue
+
+            lay_price_f = float(lay_price)
+            key = (market_id_s, int(selection_id), float(handicap or 0.0))
+
+            row = grouped.setdefault(
+                key,
+                {
+                    "matched_stake": 0.0,
+                    "matched_liability": 0.0,
+                    "matched_orders": 0.0,
+                },
+            )
+
+            row["matched_stake"] += matched
+            row["matched_liability"] += matched * max(0.0, lay_price_f - 1.0)
+            row["matched_orders"] += 1.0
+
+        except Exception:
+            continue
+
+    candidates: list[dict[str, object]] = []
+
+    for (market_id, selection_id, handicap), row in grouped.items():
+        market = markets.get(market_id)
+        if market is None:
+            continue
+
+        try:
+            line = float(over_under_line(market))
+        except Exception:
+            continue
+
+        runner = _second_leg_totals_under_runner_for_market(
+            market,
+            selection_id=selection_id,
+            handicap=handicap,
+        )
+        if runner is None:
+            continue
+
+        bl = best_level(runner.available_to_lay, side="LAY")
+        if bl is None:
+            continue
+
+        try:
+            close_price = float(bl[0])
+            close_size = float(bl[1])
+        except Exception:
+            continue
+
+        if close_price <= 1.0 or close_size <= 1e-9:
+            continue
+
+        matched_stake = float(row.get("matched_stake", 0.0) or 0.0)
+        matched_liability = float(row.get("matched_liability", 0.0) or 0.0)
+
+        if matched_stake <= 1e-9:
+            continue
+
+        avg_lay_price = 1.0 + matched_liability / matched_stake
+        full_hedge_back_stake = (matched_stake + matched_liability) / close_price
+        already_back_stake = float(filled_totals_by_key.get((market_id, int(selection_id), float(handicap)), 0.0))
+        residual_hedge_back_stake = max(0.0, float(full_hedge_back_stake) - already_back_stake)
+
+        hedge_back_stake = min(float(residual_hedge_back_stake), float(close_size))
+
+        if hedge_back_stake <= SECOND_LEG_TOTALS_GREENUP_MIN_EXEC_STAKE:
+            continue
+
+        line_greenup_if_full = matched_stake - full_hedge_back_stake
+        residual_after_action = max(0.0, float(residual_hedge_back_stake) - float(hedge_back_stake))
+        hedge_completion = residual_after_action <= SECOND_LEG_TOTALS_GREENUP_MIN_EXEC_STAKE
+
+        # Count greenup only when this action completes the residual hedge.
+        # Partial hedge can still be useful for SLC improvement, but it is not realized greenup.
+        greenup = line_greenup_if_full if hedge_completion else 0.0
+
+        trial_profile = _second_leg_apply_totals_back_preview(
+            base_bucket=base_bucket,
+            line=line,
+            price=close_price,
+            stake=hedge_back_stake,
+        )
+
+        worst_if_full = min(float(v) for v in trial_profile.values())
+        best_if_full = max(float(v) for v in trial_profile.values())
+        worst_improvement = float(worst_if_full) - float(current_worst)
+
+        candidates.append(
+            {
+                "mode": "TAKER_BACK_TOTALS_GREENUP",
+                "side": "BACK",
+                "market_id": market_id,
+                "runner": str(runner.name or runner.selection_id),
+                "selection_id": int(selection_id),
+                "handicap": float(handicap),
+                "line": round(float(line), 6),
+                "price": round(float(close_price), 6),
+                "available": round(float(close_size), 6),
+                "stake": round(float(hedge_back_stake), 6),
+                "full_hedge_back_stake": round(float(full_hedge_back_stake), 6),
+                "already_back_stake": round(float(already_back_stake), 6),
+                "residual_hedge_back_stake": round(float(residual_hedge_back_stake), 6),
+                "residual_after_action": round(float(residual_after_action), 6),
+                "hedge_completion": bool(hedge_completion),
+                "line_greenup_if_full": round(float(line_greenup_if_full), 6),
+                "matched_lay_stake": round(float(matched_stake), 6),
+                "matched_lay_liability": round(float(matched_liability), 6),
+                "avg_lay_price": round(float(avg_lay_price), 6),
+                "greenup": round(float(greenup), 6),
+                "current_worst": round(float(current_worst), 6),
+                "worst_if_full": round(float(worst_if_full), 6),
+                "best_if_full": round(float(best_if_full), 6),
+                "worst_improvement": round(float(worst_improvement), 6),
+                "profile_if_full": {k: round(float(v), 6) for k, v in trial_profile.items()},
+            }
+        )
+
+    candidates.sort(
+        key=lambda x: (
+            float(x.get("greenup") or 0.0) > SECOND_LEG_TOTALS_GREENUP_MIN_GREENUP,
+            float(x.get("worst_improvement") or 0.0),
+            float(x.get("greenup") or 0.0),
+            float(x.get("stake") or 0.0),
+        ),
+        reverse=True,
+    )
+
+    accepted = [
+        c for c in candidates
+        if (
+            float(c.get("stake") or 0.0) > SECOND_LEG_TOTALS_GREENUP_MIN_EXEC_STAKE
+            and float(c.get("line_greenup_if_full", c.get("greenup")) or 0.0) >= SECOND_LEG_TOTALS_GREENUP_MIN_GREENUP
+            and float(c.get("worst_improvement") or 0.0) >= -SECOND_LEG_PREVIEW_WORST_EPS
+        )
+    ]
+
+    if not accepted:
+        return {
+            "mode": "NO_TOTALS_GREENUP",
+            "reason": "no_positive_safe_totals_greenup",
+            "actions": [],
+            "action_count": 0,
+            "current_worst": round(float(current_worst), 6),
+            "current_best": round(float(current_best), 6),
+            "top_candidates": candidates[:10],
+        }
+
+    best = accepted[0]
+
+    return {
+        "mode": "TAKER_BACK_TOTALS_GREENUP_PREVIEW",
+        "reason": "positive_totals_greenup_or_worst_improvement",
+        "actions": [best],
+        "action_count": 1,
+        "current_worst": round(float(current_worst), 6),
+        "current_best": round(float(current_best), 6),
+        "greenup": best.get("greenup"),
+        "worst_if_full": best.get("worst_if_full"),
+        "best_if_full": best.get("best_if_full"),
+        "worst_improvement": best.get("worst_improvement"),
+        "top_candidates": candidates[:10],
+    }
+
+
+
+def _second_leg_apply_totals_back_actions(
+    *,
+    base_bucket: dict[str, float],
+    actions: list[dict[str, object]] | None,
+) -> dict[str, float]:
+    out = dict(base_bucket)
+
+    for a in list(actions or []):
+        try:
+            line = float(a.get("line"))
+            price = float(a.get("price"))
+            stake = float(a.get("stake"))
+        except Exception:
+            continue
+
+        if price <= 1.0 or stake <= 0:
+            continue
+
+        out = _second_leg_apply_totals_back_preview(
+            base_bucket=out,
+            line=line,
+            price=price,
+            stake=stake,
+        )
+
+    return out
+
+
+def _second_leg_compact_totals_greenup_actions(actions: list[dict[str, object]] | None) -> dict[str, object]:
+    rows = [
+        x for x in list(actions or [])
+        if float(x.get("stake", 0.0) or 0.0) > SECOND_LEG_TOTALS_GREENUP_MIN_EXEC_STAKE
+    ]
+    total_stake = sum(float(x.get("stake", 0.0) or 0.0) for x in rows)
+
+    # Do NOT sum full line greenup on every partial action.
+    # Count latest completed hedge greenup per line key only.
+    latest_completed_greenup_by_key: dict[tuple[str, int, float], float] = {}
+    for x in rows:
+        try:
+            key = (
+                str(x.get("market_id")),
+                int(x.get("selection_id")),
+                float(x.get("handicap") or 0.0),
+            )
+            if bool(x.get("hedge_completion")):
+                latest_completed_greenup_by_key[key] = float(x.get("line_greenup_if_full", x.get("greenup", 0.0)) or 0.0)
+        except Exception:
+            continue
+
+    total_greenup = sum(float(v) for v in latest_completed_greenup_by_key.values())
+
+    top = []
+    for a in rows[-20:]:
+        top.append(
+            {
+                "seq": a.get("seq"),
+                "frame": a.get("frame"),
+                "pt": a.get("pt"),
+                "market_id": a.get("market_id"),
+                "runner": a.get("runner"),
+                "line": a.get("line"),
+                "price": a.get("price"),
+                "stake": a.get("stake"),
+                "greenup": a.get("greenup"),
+                "line_greenup_if_full": a.get("line_greenup_if_full"),
+                "hedge_completion": a.get("hedge_completion"),
+                "residual_after_action": a.get("residual_after_action"),
+                "worst_improvement": a.get("worst_improvement"),
+                "reason": a.get("reason"),
+            }
+        )
+
+    return {
+        "count": len(rows),
+        "stake": round(total_stake, 6),
+        "greenup": round(total_greenup, 6),
+        "top": top,
+    }
+
+
+
+def _second_leg_totals_back_stake_by_key(
+    *action_lists: list[dict[str, object]] | None,
+) -> dict[tuple[str, int, float], float]:
+    out: dict[tuple[str, int, float], float] = {}
+
+    for actions in action_lists:
+        for a in list(actions or []):
+            try:
+                stake = float(a.get("stake", 0.0) or 0.0)
+                if stake <= 0:
+                    continue
+
+                key = (
+                    str(a.get("market_id")),
+                    int(a.get("selection_id")),
+                    float(a.get("handicap") or 0.0),
+                )
+                out[key] = out.get(key, 0.0) + stake
+            except Exception:
+                continue
+
+    return out
+
+
+def _second_leg_compact_totals_risk_reduction_actions(actions: list[dict[str, object]] | None) -> dict[str, object]:
+    rows = [
+        x for x in list(actions or [])
+        if float(x.get("stake", 0.0) or 0.0) > SECOND_LEG_TOTALS_GREENUP_MIN_EXEC_STAKE
+    ]
+    total_stake = sum(float(x.get("stake", 0.0) or 0.0) for x in rows)
+    total_cost = sum(float(x.get("cost", 0.0) or 0.0) for x in rows)
+
+    top = []
+    for a in rows[-20:]:
+        top.append(
+            {
+                "seq": a.get("seq"),
+                "frame": a.get("frame"),
+                "pt": a.get("pt"),
+                "market_id": a.get("market_id"),
+                "runner": a.get("runner"),
+                "line": a.get("line"),
+                "price": a.get("price"),
+                "stake": a.get("stake"),
+                "cost": a.get("cost"),
+                "line_greenup_if_full": a.get("line_greenup_if_full"),
+                "worst_improvement": a.get("worst_improvement"),
+                "improvement_per_cost": a.get("improvement_per_cost"),
+                "hedge_completion": a.get("hedge_completion"),
+                "residual_after_action": a.get("residual_after_action"),
+                "reason": a.get("reason"),
+            }
+        )
+
+    return {
+        "count": len(rows),
+        "stake": round(total_stake, 6),
+        "cost": round(total_cost, 6),
+        "top": top,
+    }
+
+
+def _second_leg_compact_filled_actions(actions: list[dict[str, object]] | None) -> dict[str, object]:
+    rows = list(actions or [])
+    total_stake = sum(float(x.get("stake", 0.0) or 0.0) for x in rows)
+
+    top = []
+    for a in rows[-20:]:
+        top.append(
+            {
+                "seq": a.get("seq"),
+                "frame": a.get("frame"),
+                "pt": a.get("pt"),
+                "mode": a.get("mode"),
+                "side": a.get("side"),
+                "runner": a.get("runner"),
+                "price": a.get("price"),
+                "stake": a.get("stake"),
+                "reason": a.get("reason"),
+            }
+        )
+
+    return {
+        "count": len(rows),
+        "stake": round(total_stake, 6),
+        "top": top,
+    }
+
+
+def _second_leg_compact_package(pkg: dict[str, object] | None) -> dict[str, object]:
+    if not isinstance(pkg, dict):
+        return {
+            "mode": "-",
+            "actions": 0,
+            "capital": 0.0,
+            "worst_if_full": None,
+            "top": [],
+        }
+
+    actions = list(pkg.get("actions") or [])
+
+    top = []
+    for a in actions[:12]:
+        top.append(
+            {
+                "mode": a.get("mode"),
+                "side": a.get("side"),
+                "runner": a.get("runner"),
+                "price": a.get("price"),
+                "stake": a.get("stake"),
+                "queue": a.get("queue"),
+                "buckets": a.get("buckets"),
+                "critical_buckets": a.get("critical_buckets"),
+            }
+        )
+
+    return {
+        "mode": pkg.get("mode"),
+        "reason": pkg.get("reason"),
+        "actions": int(pkg.get("action_count") or 0),
+        "capital": float(pkg.get("capital") or 0.0),
+        "worst_if_full": pkg.get("worst_if_full"),
+        "partial_worst_min": pkg.get("partial_worst_min"),
+        "scale_from_full_package": pkg.get("scale_from_full_package"),
+        "maker_back_inverse_sum": pkg.get("maker_back_inverse_sum"),
+        "critical_virtual_row_count": pkg.get("critical_virtual_row_count"),
+        "top": top,
+    }
+
+
+
+def _second_leg_level_size_at_price(levels: object, price: float) -> float | None:
+    try:
+        target = float(price)
+    except Exception:
+        return None
+
+    for lvl in levels or []:
+        p = None
+        s = None
+
+        try:
+            if isinstance(lvl, dict):
+                p = lvl.get("price")
+                s = lvl.get("size")
+            else:
+                try:
+                    p = lvl[0]
+                    s = lvl[1]
+                except Exception:
+                    p = getattr(lvl, "price")
+                    s = getattr(lvl, "size")
+        except Exception:
+            continue
+
+        try:
+            p_f = float(p)
+            s_f = float(s)
+        except Exception:
+            continue
+
+        if abs(p_f - target) < 1e-9:
+            return s_f
+
+    return None
+
+
+def _second_leg_find_cs_runner_by_name(
+    markets: dict[str, MarketState] | None,
+    runner_name: str,
+) -> RunnerState | None:
+    target = str(runner_name)
+
+    for st in (markets or {}).values():
+        if st is None:
+            continue
+        if not is_correct_score(st):
+            continue
+
+        for r in st.runners.values():
+            if str(r.name or r.selection_id) == target:
+                return r
+
+    return None
+
+
+def _second_leg_shadow_fill_probe(
+    *,
+    markets: dict[str, MarketState] | None,
+    package_preview: dict[str, object] | None,
+    active: bool,
+) -> dict[str, object]:
+    """
+    Read-only SECOND LEG fill probe v0.
+
+    Does NOT change exposure.
+    Does NOT modify order_model.
+    Does NOT trigger real cancel/place.
+
+    v0 fill rule:
+      MAKER BACK is considered fill-signaled only if current best_lay <= order price.
+
+    Queue movement is logged but not trusted as fill yet.
+    """
+    if not active:
+        return {
+            "status": "INACTIVE",
+            "reason": "package_not_placed",
+            "fills": [],
+            "filled_actions": 0,
+            "filled_stake": 0.0,
+        }
+
+    if not isinstance(package_preview, dict):
+        return {
+            "status": "NO_PACKAGE",
+            "reason": "missing_package",
+            "fills": [],
+            "filled_actions": 0,
+            "filled_stake": 0.0,
+        }
+
+    actions = list(package_preview.get("actions") or [])
+    if not actions:
+        return {
+            "status": "NO_ACTIONS",
+            "reason": "package_has_no_actions",
+            "fills": [],
+            "filled_actions": 0,
+            "filled_stake": 0.0,
+        }
+
+    fills: list[dict[str, object]] = []
+    probes: list[dict[str, object]] = []
+
+    for a in actions:
+        mode = str(a.get("mode") or "")
+        side = str(a.get("side") or "")
+        runner = str(a.get("runner") or "")
+
+        try:
+            order_price = float(a.get("price") or 0.0)
+            order_stake = float(a.get("stake") or 0.0)
+            queue_at_decision = float(a.get("queue") or 0.0)
+        except Exception:
+            continue
+
+        r = _second_leg_find_cs_runner_by_name(markets, runner)
+        if r is None:
+            probes.append(
+                {
+                    "runner": runner,
+                    "mode": mode,
+                    "side": side,
+                    "price": order_price,
+                    "stake": order_stake,
+                    "status": "RUNNER_MISSING",
+                }
+            )
+            continue
+
+        bb = best_level(r.available_to_back, side="BACK")
+        bl = best_level(r.available_to_lay, side="LAY")
+
+        current_bb_price = None if bb is None else float(bb[0])
+        current_bb_size = None if bb is None else float(bb[1])
+        current_bl_price = None if bl is None else float(bl[0])
+        current_bl_size = None if bl is None else float(bl[1])
+        current_size_at_order_price = _second_leg_level_size_at_price(
+            r.available_to_back,
+            order_price,
+        )
+
+        # fallback to current best BACK size when our order price is the visible best back.
+        # This is enough for queue diagnostics on top-of-book maker BACK orders even if
+        # the raw ladder level container is not directly parseable here.
+        if (
+            current_size_at_order_price is None
+            and current_bb_price is not None
+            and abs(float(current_bb_price) - float(order_price)) < 1e-9
+        ):
+            current_size_at_order_price = current_bb_size
+
+        fill_size = 0.0
+        fill_reason = "NONE"
+
+        if mode == "MAKER" and side == "BACK":
+            if current_bl_price is not None and current_bl_price <= order_price:
+                fill_size = order_stake
+                fill_reason = "PRICE_CROSSED_BY_BEST_LAY"
+
+        probe = {
+            "runner": runner,
+            "mode": mode,
+            "side": side,
+            "price": order_price,
+            "stake": order_stake,
+            "queue_at_decision": queue_at_decision,
+            "current_bb": current_bb_price,
+            "current_bb_size": current_bb_size,
+            "current_bl": current_bl_price,
+            "current_bl_size": current_bl_size,
+            "current_size_at_order_price": current_size_at_order_price,
+            "fill_size": round(fill_size, 6),
+            "fill_reason": fill_reason,
+        }
+
+        probes.append(probe)
+
+        if fill_size > 1e-9:
+            fills.append(probe)
+
+    filled_stake = sum(float(x.get("fill_size", 0.0) or 0.0) for x in fills)
+    total_stake = sum(float(a.get("stake", 0.0) or 0.0) for a in actions)
+
+    if filled_stake <= 1e-9:
+        status = "NONE"
+    elif filled_stake + 1e-9 >= total_stake:
+        status = "FULL_SIGNAL"
+    else:
+        status = "PARTIAL_SIGNAL"
+
+    return {
+        "status": status,
+        "reason": "maker_back_price_cross_probe_v0",
+        "filled_actions": len(fills),
+        "action_count": len(actions),
+        "filled_stake": round(filled_stake, 6),
+        "total_stake": round(total_stake, 6),
+        "fills": fills[:20],
+        "probes": probes[:20],
+    }
+
+
+
+
+def _second_leg_totals_risk_reduction_preview(
+    *,
+    markets: dict[str, MarketState] | None,
+    second_leg_combined_profile: dict[str, object],
+    filled_totals_greenup_actions: list[dict[str, object]] | None = None,
+    filled_totals_risk_reduction_actions: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    """
+    Read-only paid totals risk-reduction preview v0.
+
+    This is NOT greenup.
+
+    It allows closing part of the totals first-leg at negative greenup only if:
+      - SLC worst improves materially
+      - cost is capped
+      - improvement/cost is good enough
+      - action does not worsen SLC worst
+
+    Does NOT execute.
+    Does NOT mutate state.
+    """
+    profile = second_leg_combined_profile.get("profile")
+    if not isinstance(profile, dict) or not profile:
+        return {
+            "mode": "NO_TOTALS_RISK_REDUCTION",
+            "reason": "missing_combined_profile",
+            "actions": [],
+            "action_count": 0,
+        }
+
+    base_bucket = {str(k): float(v) for k, v in profile.items()}
+    current_worst = min(base_bucket.values())
+    current_best = max(base_bucket.values())
+
+    filled_trr_cost_used = sum(
+        float(x.get("cost", 0.0) or 0.0)
+        for x in list(filled_totals_risk_reduction_actions or [])
+    )
+    remaining_trr_cost_budget = max(
+        0.0,
+        float(SECOND_LEG_TOTALS_RISK_REDUCTION_MAX_TOTAL_COST) - float(filled_trr_cost_used),
+    )
+
+    if remaining_trr_cost_budget <= SECOND_LEG_PREVIEW_WORST_EPS:
+        return {
+            "mode": "NO_TOTALS_RISK_REDUCTION",
+            "reason": "total_trr_cost_budget_exhausted",
+            "actions": [],
+            "action_count": 0,
+            "current_worst": round(float(current_worst), 6),
+            "current_best": round(float(current_best), 6),
+            "filled_trr_cost_used": round(float(filled_trr_cost_used), 6),
+            "remaining_trr_cost_budget": round(float(remaining_trr_cost_budget), 6),
+            "max_total_trr_cost": round(float(SECOND_LEG_TOTALS_RISK_REDUCTION_MAX_TOTAL_COST), 6),
+        }
+
+    if current_worst >= -SECOND_LEG_PREVIEW_WORST_EPS:
+        return {
+            "mode": "NO_TOTALS_RISK_REDUCTION",
+            "reason": "slc_worst_not_negative",
+            "actions": [],
+            "action_count": 0,
+            "current_worst": round(float(current_worst), 6),
+            "current_best": round(float(current_best), 6),
+        }
+
+    if not MAKER_UNDER_LAY_GRID_ENABLED or not MAKER_UNDER_LAY_GRID_MATCHING_ENABLED:
+        return {
+            "mode": "NO_TOTALS_RISK_REDUCTION",
+            "reason": "maker_under_lay_grid_not_active",
+            "actions": [],
+            "action_count": 0,
+            "current_worst": round(float(current_worst), 6),
+            "current_best": round(float(current_best), 6),
+        }
+
+    markets = markets or {}
+
+    try:
+        visible_market_ids = _maker_under_lay_grid_canonical_totals_market_ids(markets)
+    except Exception:
+        visible_market_ids = set(str(k) for k in markets.keys())
+
+    filled_totals_by_key = _second_leg_totals_back_stake_by_key(
+        filled_totals_greenup_actions,
+        filled_totals_risk_reduction_actions,
+    )
+
+    grouped: dict[tuple[str, int, float], dict[str, float]] = {}
+
+    for okey, st in MAKER_UNDER_LAY_GRID_ORDER_STATE.items():
+        try:
+            market_id, selection_id, handicap, lay_price = okey
+            market_id_s = str(market_id)
+
+            if visible_market_ids and market_id_s not in visible_market_ids:
+                continue
+
+            matched = float(st.get("matched", 0.0) or 0.0)
+            if matched <= 1e-9:
+                continue
+
+            lay_price_f = float(lay_price)
+            key = (market_id_s, int(selection_id), float(handicap or 0.0))
+
+            row = grouped.setdefault(
+                key,
+                {
+                    "matched_stake": 0.0,
+                    "matched_liability": 0.0,
+                    "matched_orders": 0.0,
+                },
+            )
+
+            row["matched_stake"] += matched
+            row["matched_liability"] += matched * max(0.0, lay_price_f - 1.0)
+            row["matched_orders"] += 1.0
+
+        except Exception:
+            continue
+
+    candidates: list[dict[str, object]] = []
+
+    for (market_id, selection_id, handicap), row in grouped.items():
+        market = markets.get(market_id)
+        if market is None:
+            continue
+
+        try:
+            line = float(over_under_line(market))
+        except Exception:
+            continue
+
+        runner = _second_leg_totals_under_runner_for_market(
+            market,
+            selection_id=selection_id,
+            handicap=handicap,
+        )
+        if runner is None:
+            continue
+
+        bl = best_level(runner.available_to_lay, side="LAY")
+        if bl is None:
+            continue
+
+        try:
+            close_price = float(bl[0])
+            close_size = float(bl[1])
+        except Exception:
+            continue
+
+        if close_price <= 1.0 or close_size <= 1e-9:
+            continue
+
+        matched_stake = float(row.get("matched_stake", 0.0) or 0.0)
+        matched_liability = float(row.get("matched_liability", 0.0) or 0.0)
+
+        if matched_stake <= 1e-9:
+            continue
+
+        full_hedge_back_stake = (matched_stake + matched_liability) / close_price
+        if full_hedge_back_stake <= 1e-9:
+            continue
+
+        line_greenup_if_full = matched_stake - full_hedge_back_stake
+
+        # This module is paid risk reduction only.
+        # Positive greenup belongs to TOTALS_GREENUP_PREVIEW.
+        if line_greenup_if_full >= -SECOND_LEG_TOTALS_GREENUP_MIN_GREENUP:
+            continue
+
+        key = (market_id, int(selection_id), float(handicap))
+        already_back_stake = float(filled_totals_by_key.get(key, 0.0))
+        residual_hedge_back_stake = max(0.0, float(full_hedge_back_stake) - already_back_stake)
+
+        if residual_hedge_back_stake <= SECOND_LEG_TOTALS_GREENUP_MIN_EXEC_STAKE:
+            continue
+
+        line_cost_if_full = max(0.0, -float(line_greenup_if_full))
+        cost_per_back_stake = line_cost_if_full / full_hedge_back_stake
+
+        if cost_per_back_stake <= 1e-12:
+            continue
+
+        per_action_cost_budget = min(
+            float(SECOND_LEG_TOTALS_RISK_REDUCTION_MAX_COST),
+            float(remaining_trr_cost_budget),
+        )
+        max_stake_by_cost = float(per_action_cost_budget) / cost_per_back_stake
+
+        hedge_back_stake = min(
+            float(residual_hedge_back_stake),
+            float(close_size),
+            float(SECOND_LEG_TOTALS_RISK_REDUCTION_MAX_STAKE),
+            float(max_stake_by_cost),
+        )
+
+        if hedge_back_stake <= SECOND_LEG_TOTALS_GREENUP_MIN_EXEC_STAKE:
+            continue
+
+        action_cost = hedge_back_stake * cost_per_back_stake
+        residual_after_action = max(0.0, float(residual_hedge_back_stake) - float(hedge_back_stake))
+        hedge_completion = residual_after_action <= SECOND_LEG_TOTALS_GREENUP_MIN_EXEC_STAKE
+
+        trial_profile = _second_leg_apply_totals_back_preview(
+            base_bucket=base_bucket,
+            line=line,
+            price=close_price,
+            stake=hedge_back_stake,
+        )
+
+        worst_if_full = min(float(v) for v in trial_profile.values())
+        best_if_full = max(float(v) for v in trial_profile.values())
+        worst_improvement = float(worst_if_full) - float(current_worst)
+
+        if worst_improvement < SECOND_LEG_TOTALS_RISK_REDUCTION_MIN_WORST_IMPROVEMENT:
+            continue
+
+        if action_cost > SECOND_LEG_TOTALS_RISK_REDUCTION_MAX_COST + SECOND_LEG_PREVIEW_WORST_EPS:
+            continue
+
+        if action_cost > remaining_trr_cost_budget + SECOND_LEG_PREVIEW_WORST_EPS:
+            continue
+
+        improvement_per_cost = worst_improvement / max(action_cost, 1e-12)
+
+        if improvement_per_cost < SECOND_LEG_TOTALS_RISK_REDUCTION_MIN_IMPROVEMENT_PER_COST:
+            continue
+
+        candidates.append(
+            {
+                "mode": "TAKER_BACK_TOTALS_RISK_REDUCTION",
+                "side": "BACK",
+                "market_id": market_id,
+                "runner": str(runner.name or runner.selection_id),
+                "selection_id": int(selection_id),
+                "handicap": float(handicap),
+                "line": round(float(line), 6),
+                "price": round(float(close_price), 6),
+                "available": round(float(close_size), 6),
+                "stake": round(float(hedge_back_stake), 6),
+                "full_hedge_back_stake": round(float(full_hedge_back_stake), 6),
+                "already_back_stake": round(float(already_back_stake), 6),
+                "residual_hedge_back_stake": round(float(residual_hedge_back_stake), 6),
+                "residual_after_action": round(float(residual_after_action), 6),
+                "hedge_completion": bool(hedge_completion),
+                "matched_lay_stake": round(float(matched_stake), 6),
+                "matched_lay_liability": round(float(matched_liability), 6),
+                "line_greenup_if_full": round(float(line_greenup_if_full), 6),
+                "cost": round(float(action_cost), 6),
+                "filled_trr_cost_used": round(float(filled_trr_cost_used), 6),
+                "remaining_trr_cost_budget": round(float(remaining_trr_cost_budget), 6),
+                "max_total_trr_cost": round(float(SECOND_LEG_TOTALS_RISK_REDUCTION_MAX_TOTAL_COST), 6),
+                "current_worst": round(float(current_worst), 6),
+                "worst_if_full": round(float(worst_if_full), 6),
+                "best_if_full": round(float(best_if_full), 6),
+                "worst_improvement": round(float(worst_improvement), 6),
+                "improvement_per_cost": round(float(improvement_per_cost), 6),
+                "profile_if_full": {k: round(float(v), 6) for k, v in trial_profile.items()},
+            }
+        )
+
+    candidates.sort(
+        key=lambda x: (
+            float(x.get("worst_improvement") or 0.0),
+            float(x.get("improvement_per_cost") or 0.0),
+            -float(x.get("cost") or 0.0),
+        ),
+        reverse=True,
+    )
+
+    if not candidates:
+        return {
+            "mode": "NO_TOTALS_RISK_REDUCTION",
+            "reason": "no_paid_risk_reduction_candidate",
+            "actions": [],
+            "action_count": 0,
+            "current_worst": round(float(current_worst), 6),
+            "current_best": round(float(current_best), 6),
+            "max_cost": round(float(SECOND_LEG_TOTALS_RISK_REDUCTION_MAX_COST), 6),
+            "filled_trr_cost_used": round(float(filled_trr_cost_used), 6),
+            "remaining_trr_cost_budget": round(float(remaining_trr_cost_budget), 6),
+            "max_total_trr_cost": round(float(SECOND_LEG_TOTALS_RISK_REDUCTION_MAX_TOTAL_COST), 6),
+            "min_worst_improvement": round(float(SECOND_LEG_TOTALS_RISK_REDUCTION_MIN_WORST_IMPROVEMENT), 6),
+            "min_improvement_per_cost": round(float(SECOND_LEG_TOTALS_RISK_REDUCTION_MIN_IMPROVEMENT_PER_COST), 6),
+        }
+
+    best = candidates[0]
+
+    return {
+        "mode": "TAKER_BACK_TOTALS_RISK_REDUCTION_PREVIEW",
+        "reason": "paid_totals_risk_reduction_improves_slc_worst",
+        "actions": [best],
+        "action_count": 1,
+        "current_worst": round(float(current_worst), 6),
+        "current_best": round(float(current_best), 6),
+        "cost": best.get("cost"),
+        "filled_trr_cost_used": round(float(filled_trr_cost_used), 6),
+        "remaining_trr_cost_budget": round(float(remaining_trr_cost_budget), 6),
+        "max_total_trr_cost": round(float(SECOND_LEG_TOTALS_RISK_REDUCTION_MAX_TOTAL_COST), 6),
+        "worst_if_full": best.get("worst_if_full"),
+        "best_if_full": best.get("best_if_full"),
+        "worst_improvement": best.get("worst_improvement"),
+        "improvement_per_cost": best.get("improvement_per_cost"),
+        "top_candidates": candidates[:10],
+    }
+
+
+
+
+def _second_leg_apply_cs_lay_preview(
+    *,
+    virtual_rows: list[dict[str, object]],
+    base_bucket: dict[str, float],
+    runner: str,
+    price: float,
+    stake: float,
+) -> dict[str, float]:
+    """
+    Preview CS LAY as negative BACK:
+      selected runner outcomes: -stake * (price - 1)
+      all other outcomes: +stake
+    """
+    return _second_leg_apply_back_preview(
+        virtual_rows=virtual_rows,
+        base_bucket=base_bucket,
+        package=[
+            {
+                "mode": "TAKER",
+                "side": "LAY",
+                "runner": runner,
+                "price": float(price),
+                "stake": -float(stake),
+            }
+        ],
+    )
+
+
+def _second_leg_cs_taker_lay_recovery_preview(
+    *,
+    markets: dict[str, MarketState] | None,
+    second_leg_combined_profile: dict[str, object],
+) -> dict[str, object]:
+    """
+    Read-only CS recovery preview v0.
+
+    Looks for TAKER LAY on Correct Score:
+      - use current best BACK liquidity
+      - price <= SECOND_LEG_CS_RECOVERY_LAY_MAX_PRICE
+      - only when SLC worst is negative
+      - action must improve SLC worst
+      - stake/liability capped
+
+    Does NOT execute.
+    Does NOT mutate state.
+    """
+    profile = second_leg_combined_profile.get("profile")
+    if not isinstance(profile, dict) or not profile:
+        return {
+            "mode": "NO_CS_RECOVERY",
+            "reason": "missing_combined_profile",
+            "actions": [],
+            "action_count": 0,
+        }
+
+    base_bucket = {str(k): float(v) for k, v in profile.items()}
+    current_worst = min(base_bucket.values())
+    current_best = max(base_bucket.values())
+
+    if current_worst >= -SECOND_LEG_PREVIEW_WORST_EPS:
+        return {
+            "mode": "NO_CS_RECOVERY",
+            "reason": "slc_worst_not_negative",
+            "actions": [],
+            "action_count": 0,
+            "current_worst": round(float(current_worst), 6),
+            "current_best": round(float(current_best), 6),
+        }
+
+    virtual_rows = _second_leg_cs_virtual_rows(markets)
+    candidates: list[dict[str, object]] = []
+
+    for st in (markets or {}).values():
+        if st is None:
+            continue
+        if not is_correct_score(st):
+            continue
+
+        for r in st.runners.values():
+            runner_name = str(r.name or r.selection_id)
+
+            bb = best_level(r.available_to_back, side="BACK")
+            if bb is None:
+                continue
+
+            try:
+                price = float(bb[0])
+                avail = float(bb[1])
+            except Exception:
+                continue
+
+            if price <= 1.0:
+                continue
+            if price > SECOND_LEG_CS_RECOVERY_LAY_MAX_PRICE:
+                continue
+            if avail <= 1e-9:
+                continue
+
+            max_stake_by_liability = float(SECOND_LEG_CS_RECOVERY_MAX_LIABILITY) / max(price - 1.0, 1e-12)
+            max_stake = min(
+                float(avail),
+                float(SECOND_LEG_CS_RECOVERY_MAX_STAKE),
+                float(max_stake_by_liability),
+            )
+
+            if max_stake <= 1e-9:
+                continue
+
+            lo = 0.0
+            hi = max_stake
+            best_profile = None
+            best_stake = 0.0
+            best_worst = current_worst
+            best_best = current_best
+
+            for _ in range(24):
+                mid = (lo + hi) / 2.0
+                trial = _second_leg_apply_cs_lay_preview(
+                    virtual_rows=virtual_rows,
+                    base_bucket=base_bucket,
+                    runner=runner_name,
+                    price=price,
+                    stake=mid,
+                )
+
+                if not trial:
+                    hi = mid
+                    continue
+
+                trial_worst = min(float(v) for v in trial.values())
+                trial_best = max(float(v) for v in trial.values())
+
+                # Safe: never worsen current SLC worst.
+                if trial_worst >= current_worst - SECOND_LEG_PREVIEW_WORST_EPS:
+                    lo = mid
+                    best_profile = trial
+                    best_stake = mid
+                    best_worst = trial_worst
+                    best_best = trial_best
+                else:
+                    hi = mid
+
+            if best_profile is None or best_stake <= 1e-9:
+                continue
+
+            worst_improvement = float(best_worst) - float(current_worst)
+
+            if worst_improvement < SECOND_LEG_CS_RECOVERY_MIN_WORST_IMPROVEMENT:
+                continue
+
+            liability = best_stake * max(0.0, price - 1.0)
+
+            candidates.append(
+                {
+                    "mode": "TAKER_LAY_CS_RECOVERY",
+                    "side": "LAY",
+                    "runner": runner_name,
+                    "price": round(float(price), 6),
+                    "stake": round(float(best_stake), 6),
+                    "available": round(float(avail), 6),
+                    "liability": round(float(liability), 6),
+                    "current_worst": round(float(current_worst), 6),
+                    "current_best": round(float(current_best), 6),
+                    "worst_if_full": round(float(best_worst), 6),
+                    "best_if_full": round(float(best_best), 6),
+                    "worst_improvement": round(float(worst_improvement), 6),
+                    "profile_if_full": {k: round(float(v), 6) for k, v in best_profile.items()},
+                }
+            )
+
+    candidates.sort(
+        key=lambda x: (
+            float(x.get("worst_improvement") or 0.0),
+            -float(x.get("liability") or 0.0),
+            float(x.get("stake") or 0.0),
+        ),
+        reverse=True,
+    )
+
+    if not candidates:
+        return {
+            "mode": "NO_CS_RECOVERY",
+            "reason": "no_safe_taker_lay_cs_candidate",
+            "actions": [],
+            "action_count": 0,
+            "current_worst": round(float(current_worst), 6),
+            "current_best": round(float(current_best), 6),
+            "lay_max_price": round(float(SECOND_LEG_CS_RECOVERY_LAY_MAX_PRICE), 6),
+            "max_stake": round(float(SECOND_LEG_CS_RECOVERY_MAX_STAKE), 6),
+            "max_liability": round(float(SECOND_LEG_CS_RECOVERY_MAX_LIABILITY), 6),
+        }
+
+    best = candidates[0]
+
+    return {
+        "mode": "TAKER_LAY_CS_RECOVERY_PREVIEW",
+        "reason": "safe_taker_lay_cs_improves_slc_worst",
+        "actions": [best],
+        "action_count": 1,
+        "current_worst": round(float(current_worst), 6),
+        "current_best": round(float(current_best), 6),
+        "worst_if_full": best.get("worst_if_full"),
+        "best_if_full": best.get("best_if_full"),
+        "worst_improvement": best.get("worst_improvement"),
+        "liability": best.get("liability"),
+        "top_candidates": candidates[:10],
+    }
+
+
+
+def _second_leg_cs_maker_lay_recovery_preview(
+    *,
+    markets: dict[str, MarketState] | None,
+    second_leg_combined_profile: dict[str, object],
+) -> dict[str, object]:
+    """
+    Read-only CS maker LAY recovery preview v0.
+
+    This is NOT executed.
+    It only checks whether a queued maker LAY could reduce negative SLC risk.
+
+    Candidate price:
+      - current best LAY if available
+      - price <= SECOND_LEG_CS_MAKER_LAY_RECOVERY_MAX_PRICE
+
+    Safety:
+      - only when SLC worst is negative
+      - action must improve SLC worst
+      - liability capped
+    """
+    profile = second_leg_combined_profile.get("profile")
+    if not isinstance(profile, dict) or not profile:
+        return {
+            "mode": "NO_CS_MAKER_LAY_RECOVERY",
+            "reason": "missing_combined_profile",
+            "actions": [],
+            "action_count": 0,
+        }
+
+    base_bucket = {str(k): float(v) for k, v in profile.items()}
+    current_worst = min(base_bucket.values())
+    current_best = max(base_bucket.values())
+
+    if current_worst >= -SECOND_LEG_PREVIEW_WORST_EPS:
+        return {
+            "mode": "NO_CS_MAKER_LAY_RECOVERY",
+            "reason": "slc_worst_not_negative",
+            "actions": [],
+            "action_count": 0,
+            "current_worst": round(float(current_worst), 6),
+            "current_best": round(float(current_best), 6),
+        }
+
+    virtual_rows = _second_leg_cs_virtual_rows(markets)
+    candidates: list[dict[str, object]] = []
+
+    for st in (markets or {}).values():
+        if st is None:
+            continue
+        if not is_correct_score(st):
+            continue
+
+        for r in st.runners.values():
+            runner_name = str(r.name or r.selection_id)
+
+            bl = best_level(r.available_to_lay, side="LAY")
+            if bl is None:
+                continue
+
+            try:
+                price = float(bl[0])
+                queue_ahead = float(bl[1])
+            except Exception:
+                continue
+
+            if price <= 1.0:
+                continue
+            if price > SECOND_LEG_CS_MAKER_LAY_RECOVERY_MAX_PRICE:
+                continue
+
+            max_stake_by_liability = float(SECOND_LEG_CS_MAKER_LAY_RECOVERY_MAX_LIABILITY) / max(price - 1.0, 1e-12)
+            max_stake = min(
+                float(SECOND_LEG_CS_MAKER_LAY_RECOVERY_MAX_STAKE),
+                float(max_stake_by_liability),
+            )
+
+            if max_stake <= 1e-9:
+                continue
+
+            lo = 0.0
+            hi = max_stake
+            best_profile = None
+            best_stake = 0.0
+            best_worst = current_worst
+            best_best = current_best
+
+            for _ in range(24):
+                mid = (lo + hi) / 2.0
+                trial = _second_leg_apply_cs_lay_preview(
+                    virtual_rows=virtual_rows,
+                    base_bucket=base_bucket,
+                    runner=runner_name,
+                    price=price,
+                    stake=mid,
+                )
+
+                if not trial:
+                    hi = mid
+                    continue
+
+                trial_worst = min(float(v) for v in trial.values())
+                trial_best = max(float(v) for v in trial.values())
+
+                if trial_worst >= current_worst - SECOND_LEG_PREVIEW_WORST_EPS:
+                    lo = mid
+                    best_profile = trial
+                    best_stake = mid
+                    best_worst = trial_worst
+                    best_best = trial_best
+                else:
+                    hi = mid
+
+            if best_profile is None or best_stake <= 1e-9:
+                continue
+
+            worst_improvement = float(best_worst) - float(current_worst)
+
+            if worst_improvement < SECOND_LEG_CS_MAKER_LAY_RECOVERY_MIN_WORST_IMPROVEMENT:
+                continue
+
+            liability = best_stake * max(0.0, price - 1.0)
+
+            candidates.append(
+                {
+                    "mode": "MAKER_LAY_CS_RECOVERY",
+                    "side": "LAY",
+                    "runner": runner_name,
+                    "price": round(float(price), 6),
+                    "stake": round(float(best_stake), 6),
+                    "queue_ahead": round(float(queue_ahead), 6),
+                    "liability": round(float(liability), 6),
+                    "current_worst": round(float(current_worst), 6),
+                    "current_best": round(float(current_best), 6),
+                    "worst_if_full": round(float(best_worst), 6),
+                    "best_if_full": round(float(best_best), 6),
+                    "worst_improvement": round(float(worst_improvement), 6),
+                    "profile_if_full": {k: round(float(v), 6) for k, v in best_profile.items()},
+                }
+            )
+
+    candidates.sort(
+        key=lambda x: (
+            float(x.get("worst_improvement") or 0.0),
+            -float(x.get("queue_ahead") or 0.0),
+            -float(x.get("liability") or 0.0),
+            float(x.get("stake") or 0.0),
+        ),
+        reverse=True,
+    )
+
+    if not candidates:
+        return {
+            "mode": "NO_CS_MAKER_LAY_RECOVERY",
+            "reason": "no_safe_maker_lay_cs_candidate",
+            "actions": [],
+            "action_count": 0,
+            "current_worst": round(float(current_worst), 6),
+            "current_best": round(float(current_best), 6),
+            "lay_max_price": round(float(SECOND_LEG_CS_MAKER_LAY_RECOVERY_MAX_PRICE), 6),
+            "max_stake": round(float(SECOND_LEG_CS_MAKER_LAY_RECOVERY_MAX_STAKE), 6),
+            "max_liability": round(float(SECOND_LEG_CS_MAKER_LAY_RECOVERY_MAX_LIABILITY), 6),
+        }
+
+    best = candidates[0]
+
+    return {
+        "mode": "MAKER_LAY_CS_RECOVERY_PREVIEW",
+        "reason": "safe_maker_lay_cs_improves_slc_worst",
+        "actions": [best],
+        "action_count": 1,
+        "current_worst": round(float(current_worst), 6),
+        "current_best": round(float(current_best), 6),
+        "worst_if_full": best.get("worst_if_full"),
+        "best_if_full": best.get("best_if_full"),
+        "worst_improvement": best.get("worst_improvement"),
+        "liability": best.get("liability"),
+        "queue_ahead": best.get("queue_ahead"),
+        "top_candidates": candidates[:10],
+    }
+
+
+
+def _second_leg_cs_taker_back_recovery_preview(
+    *,
+    markets: dict[str, MarketState] | None,
+    second_leg_combined_profile: dict[str, object],
+) -> dict[str, object]:
+    """
+    Read-only CS TAKER BACK recovery preview v0.
+
+    This is NOT the normal maker BACK package.
+    It is allowed only if BACKing a CS runner improves current SLC worst.
+
+    Execution price = current best LAY.
+    Cost/risk = stake, capped.
+    Does NOT execute.
+    Does NOT mutate state.
+    """
+    profile = second_leg_combined_profile.get("profile")
+    if not isinstance(profile, dict) or not profile:
+        return {
+            "mode": "NO_CS_TAKER_BACK_RECOVERY",
+            "reason": "missing_combined_profile",
+            "actions": [],
+            "action_count": 0,
+        }
+
+    base_bucket = {str(k): float(v) for k, v in profile.items()}
+    current_worst = min(base_bucket.values())
+    current_best = max(base_bucket.values())
+
+    if current_worst >= -SECOND_LEG_PREVIEW_WORST_EPS:
+        return {
+            "mode": "NO_CS_TAKER_BACK_RECOVERY",
+            "reason": "slc_worst_not_negative",
+            "actions": [],
+            "action_count": 0,
+            "current_worst": round(float(current_worst), 6),
+            "current_best": round(float(current_best), 6),
+        }
+
+    virtual_rows = _second_leg_cs_virtual_rows(markets)
+    candidates: list[dict[str, object]] = []
+
+    for st in (markets or {}).values():
+        if st is None:
+            continue
+        if not is_correct_score(st):
+            continue
+
+        for r in st.runners.values():
+            runner_name = str(r.name or r.selection_id)
+
+            bl = best_level(r.available_to_lay, side="LAY")
+            if bl is None:
+                continue
+
+            try:
+                price = float(bl[0])
+                avail = float(bl[1])
+            except Exception:
+                continue
+
+            if price <= 1.0 or avail <= 1e-9:
+                continue
+
+            max_stake = min(
+                float(avail),
+                float(SECOND_LEG_CS_TAKER_BACK_RECOVERY_MAX_STAKE),
+                float(SECOND_LEG_CS_TAKER_BACK_RECOVERY_MAX_STAKE_LOSS),
+            )
+
+            if max_stake <= 1e-9:
+                continue
+
+            lo = 0.0
+            hi = max_stake
+            best_profile = None
+            best_stake = 0.0
+            best_worst = current_worst
+            best_best = current_best
+
+            for _ in range(24):
+                mid = (lo + hi) / 2.0
+                trial = _second_leg_apply_back_preview(
+                    virtual_rows=virtual_rows,
+                    base_bucket=base_bucket,
+                    package=[
+                        {
+                            "mode": "TAKER",
+                            "side": "BACK",
+                            "runner": runner_name,
+                            "price": price,
+                            "stake": mid,
+                        }
+                    ],
+                )
+
+                if not trial:
+                    hi = mid
+                    continue
+
+                trial_worst = min(float(v) for v in trial.values())
+                trial_best = max(float(v) for v in trial.values())
+
+                # Safe: never worsen current SLC worst.
+                if trial_worst >= current_worst - SECOND_LEG_PREVIEW_WORST_EPS:
+                    lo = mid
+                    best_profile = trial
+                    best_stake = mid
+                    best_worst = trial_worst
+                    best_best = trial_best
+                else:
+                    hi = mid
+
+            if best_profile is None or best_stake <= 1e-9:
+                continue
+
+            worst_improvement = float(best_worst) - float(current_worst)
+
+            if worst_improvement < SECOND_LEG_CS_TAKER_BACK_RECOVERY_MIN_WORST_IMPROVEMENT:
+                continue
+
+            candidates.append(
+                {
+                    "mode": "TAKER_BACK_CS_RECOVERY",
+                    "side": "BACK",
+                    "runner": runner_name,
+                    "price": round(float(price), 6),
+                    "stake": round(float(best_stake), 6),
+                    "available": round(float(avail), 6),
+                    "stake_loss": round(float(best_stake), 6),
+                    "current_worst": round(float(current_worst), 6),
+                    "current_best": round(float(current_best), 6),
+                    "worst_if_full": round(float(best_worst), 6),
+                    "best_if_full": round(float(best_best), 6),
+                    "worst_improvement": round(float(worst_improvement), 6),
+                    "profile_if_full": {k: round(float(v), 6) for k, v in best_profile.items()},
+                }
+            )
+
+    candidates.sort(
+        key=lambda x: (
+            float(x.get("worst_improvement") or 0.0),
+            -float(x.get("stake_loss") or 0.0),
+            float(x.get("price") or 0.0),
+        ),
+        reverse=True,
+    )
+
+    if not candidates:
+        return {
+            "mode": "NO_CS_TAKER_BACK_RECOVERY",
+            "reason": "no_safe_taker_back_cs_candidate",
+            "actions": [],
+            "action_count": 0,
+            "current_worst": round(float(current_worst), 6),
+            "current_best": round(float(current_best), 6),
+            "max_stake": round(float(SECOND_LEG_CS_TAKER_BACK_RECOVERY_MAX_STAKE), 6),
+            "max_stake_loss": round(float(SECOND_LEG_CS_TAKER_BACK_RECOVERY_MAX_STAKE_LOSS), 6),
+        }
+
+    best = candidates[0]
+
+    return {
+        "mode": "TAKER_BACK_CS_RECOVERY_PREVIEW",
+        "reason": "safe_taker_back_cs_improves_slc_worst",
+        "actions": [best],
+        "action_count": 1,
+        "current_worst": round(float(current_worst), 6),
+        "current_best": round(float(current_best), 6),
+        "worst_if_full": best.get("worst_if_full"),
+        "best_if_full": best.get("best_if_full"),
+        "worst_improvement": best.get("worst_improvement"),
+        "stake_loss": best.get("stake_loss"),
+        "top_candidates": candidates[:10],
+    }
+
+
+def _second_leg_cs_recovery_preview(
+    *,
+    markets: dict[str, MarketState] | None,
+    second_leg_combined_profile: dict[str, object],
+) -> dict[str, object]:
+    """
+    Combined CS recovery preview:
+      1. TAKER LAY recovery first
+      2. MAKER LAY recovery if taker has no safe candidate
+    """
+    taker = _second_leg_cs_taker_lay_recovery_preview(
+        markets=markets,
+        second_leg_combined_profile=second_leg_combined_profile,
+    )
+
+    if str(taker.get("mode") or "") == "TAKER_LAY_CS_RECOVERY_PREVIEW":
+        taker["priority"] = "TAKER_FIRST"
+        return taker
+
+    maker = _second_leg_cs_maker_lay_recovery_preview(
+        markets=markets,
+        second_leg_combined_profile=second_leg_combined_profile,
+    )
+
+    if str(maker.get("mode") or "") == "MAKER_LAY_CS_RECOVERY_PREVIEW":
+        maker["priority"] = "MAKER_FALLBACK_AFTER_NO_TAKER"
+        maker["taker_result"] = {
+            "mode": taker.get("mode"),
+            "reason": taker.get("reason"),
+        }
+        return maker
+
+    taker_back = _second_leg_cs_taker_back_recovery_preview(
+        markets=markets,
+        second_leg_combined_profile=second_leg_combined_profile,
+    )
+
+    if str(taker_back.get("mode") or "") == "TAKER_BACK_CS_RECOVERY_PREVIEW":
+        taker_back["priority"] = "TAKER_BACK_FALLBACK_AFTER_NO_LAY"
+        taker_back["taker_lay_result"] = {
+            "mode": taker.get("mode"),
+            "reason": taker.get("reason"),
+        }
+        taker_back["maker_lay_result"] = {
+            "mode": maker.get("mode"),
+            "reason": maker.get("reason"),
+        }
+        return taker_back
+
+    return {
+        "mode": "NO_CS_RECOVERY",
+        "reason": "no_safe_taker_lay_maker_lay_or_taker_back_cs_candidate",
+        "actions": [],
+        "action_count": 0,
+        "taker_lay_result": {
+            "mode": taker.get("mode"),
+            "reason": taker.get("reason"),
+        },
+        "maker_lay_result": {
+            "mode": maker.get("mode"),
+            "reason": maker.get("reason"),
+        },
+        "taker_back_result": {
+            "mode": taker_back.get("mode"),
+            "reason": taker_back.get("reason"),
+        },
+    }
+
+
+def _second_leg_package_recovery_blocked(pkg: dict[str, object] | None) -> bool:
+    if not isinstance(pkg, dict):
+        return False
+    return (
+        str(pkg.get("mode") or "") == "NO_SAFE_MAKER_BACK_PACKAGE"
+        and str(pkg.get("reason") or "") == "recovery_blocked_trr_budget_exhausted_negative_slc"
+    )
+
+
+def _second_leg_package_is_maker_back_risk(pkg: dict[str, object] | None) -> bool:
+    if not isinstance(pkg, dict):
+        return False
+
+    mode = str(pkg.get("mode") or "")
+    if mode.startswith("MAKER_BACK"):
+        return True
+
+    for a in list(pkg.get("actions") or []):
+        try:
+            if str(a.get("mode") or "").upper() == "MAKER" and str(a.get("side") or "").upper() == "BACK":
+                return True
+        except Exception:
+            continue
+
+    return False
+
+
+def _second_leg_apply_recovery_block_gate(
+    *,
+    package_preview: dict[str, object] | None,
+    second_leg_combined_profile: dict[str, object],
+    second_leg_totals_greenup_preview: dict[str, object],
+    second_leg_totals_risk_reduction_preview: dict[str, object],
+    filled_totals_risk_reduction_actions: list[dict[str, object]] | None,
+) -> dict[str, object]:
+    """
+    Hard safety gate:
+
+    If SLC is negative, TRR budget is exhausted, and no positive TG is available,
+    do not allow new risk-increasing CS maker BACK package.
+
+    Recovery modules may still be shown/executed separately.
+    """
+    pkg = dict(package_preview or {})
+
+    if not _second_leg_package_is_maker_back_risk(pkg):
+        return pkg
+
+    slc_worst = second_leg_combined_profile.get("worst")
+    slc_best = second_leg_combined_profile.get("best")
+    profile = second_leg_combined_profile.get("profile")
+
+    if slc_worst is None:
+        return pkg
+
+    try:
+        slc_worst_f = float(slc_worst)
+    except Exception:
+        return pkg
+
+    if slc_worst_f >= -SECOND_LEG_PREVIEW_WORST_EPS:
+        return pkg
+
+    # Positive totals greenup has priority and remains allowed.
+    if str(second_leg_totals_greenup_preview.get("mode") or "") == "TAKER_BACK_TOTALS_GREENUP_PREVIEW":
+        return pkg
+
+    trr_cost_used = sum(
+        float(x.get("cost", 0.0) or 0.0)
+        for x in list(filled_totals_risk_reduction_actions or [])
+    )
+    trr_reason = str(second_leg_totals_risk_reduction_preview.get("reason") or "")
+
+    trr_exhausted = (
+        trr_reason == "total_trr_cost_budget_exhausted"
+        or trr_cost_used >= float(SECOND_LEG_TOTALS_RISK_REDUCTION_MAX_TOTAL_COST) - SECOND_LEG_PREVIEW_WORST_EPS
+    )
+
+    if not trr_exhausted:
+        return pkg
+
+    profile_out = {}
+    if isinstance(profile, dict):
+        profile_out = {str(k): round(float(v), 6) for k, v in profile.items()}
+
+    return {
+        "mode": "NO_SAFE_MAKER_BACK_PACKAGE",
+        "reason": "recovery_blocked_trr_budget_exhausted_negative_slc",
+        "actions": [],
+        "action_count": 0,
+        "capital": 0.0,
+        "worst": round(float(slc_worst_f), 6),
+        "worst_if_full": round(float(slc_worst_f), 6),
+        "best_if_full": None if slc_best is None else round(float(slc_best), 6),
+        "profile_if_full": profile_out,
+        "slc_worst": round(float(slc_worst_f), 6),
+        "trr_cost_used": round(float(trr_cost_used), 6),
+        "max_total_trr_cost": round(float(SECOND_LEG_TOTALS_RISK_REDUCTION_MAX_TOTAL_COST), 6),
+        "trr_reason": trr_reason,
+        "tg_mode": str(second_leg_totals_greenup_preview.get("mode") or ""),
+        "blocked_original_mode": str(pkg.get("mode") or ""),
+        "blocked_original_capital": round(float(pkg.get("capital", 0.0) or 0.0), 6),
+    }
+
+
+def _second_leg_package_budget_exhausted(pkg: dict[str, object] | None) -> bool:
+    if not isinstance(pkg, dict):
+        return False
+    return (
+        str(pkg.get("mode") or "") == "NO_SAFE_MAKER_BACK_PACKAGE"
+        and str(pkg.get("reason") or "") == "total_filled_worst_budget_exhausted"
+    )
+
+
+def _second_leg_package_score(pkg: dict[str, object] | None) -> tuple[int, float, float]:
+    """
+    Higher is better.
+    Tuple:
+      accepted_rank, capital, worst_if_full
+    """
+    if not isinstance(pkg, dict):
+        return (0, 0.0, -10**9)
+
+    mode = str(pkg.get("mode") or "")
+
+    if mode in ("MAKER_BACK_MICRO_PREVIEW", "MAKER_BACK_VIRTUAL_PREVIEW"):
+        rank = 2
+    elif mode == "CLOSED":
+        rank = 3
+    elif mode in ("NO_SAFE_MAKER_BACK_PACKAGE", "NO_SAFE_BACK_PACKAGE", "REJECTED_WORSE_PROFILE", "REJECTED_PARTIAL_FILL_UNSAFE"):
+        rank = 0
+    else:
+        rank = 1
+
+    capital = float(pkg.get("capital") or 0.0)
+    worst_if_full = float(pkg.get("worst_if_full") or -10**9)
+
+    return (rank, capital, worst_if_full)
+
+
+def _second_leg_package_signal(
+    *,
+    frozen_pkg: dict[str, object] | None,
+    fresh_pkg: dict[str, object] | None,
+) -> dict[str, object]:
+    frozen_score = _second_leg_package_score(frozen_pkg)
+    fresh_score = _second_leg_package_score(fresh_pkg)
+
+    frozen_mode = None if not isinstance(frozen_pkg, dict) else str(frozen_pkg.get("mode") or "")
+    fresh_mode = None if not isinstance(fresh_pkg, dict) else str(fresh_pkg.get("mode") or "")
+
+    # Fresh became tradable while frozen is no-package/rejected.
+    if fresh_score[0] > frozen_score[0]:
+        return {
+            "signal": "BETTER_FRESH",
+            "reason": "fresh_package_rank_improved",
+            "frozen_mode": frozen_mode,
+            "fresh_mode": fresh_mode,
+            "frozen_score": frozen_score,
+            "fresh_score": fresh_score,
+        }
+
+    # Frozen package is tradable but current fresh validation says unsafe/no-safe.
+    if frozen_score[0] > fresh_score[0]:
+        return {
+            "signal": "FRESH_WORSE",
+            "reason": "fresh_package_rank_worse",
+            "frozen_mode": frozen_mode,
+            "fresh_mode": fresh_mode,
+            "frozen_score": frozen_score,
+            "fresh_score": fresh_score,
+        }
+
+    # Same rank, but fresh capital differs materially.
+    frozen_cap = frozen_score[1]
+    fresh_cap = fresh_score[1]
+
+    if abs(fresh_cap - frozen_cap) >= 0.25:
+        return {
+            "signal": "FRESH_SIZE_CHANGED",
+            "reason": "fresh_capital_changed",
+            "frozen_mode": frozen_mode,
+            "fresh_mode": fresh_mode,
+            "frozen_capital": frozen_cap,
+            "fresh_capital": fresh_cap,
+            "frozen_score": frozen_score,
+            "fresh_score": fresh_score,
+        }
+
+    return {
+        "signal": "OK",
+        "reason": "frozen_package_still_current_enough",
+        "frozen_mode": frozen_mode,
+        "fresh_mode": fresh_mode,
+        "frozen_score": frozen_score,
+        "fresh_score": fresh_score,
+    }
+
+
+def _second_leg_debug_write_jsonl(
+    *,
+    debug_jsonl: str | None,
+    payload: dict[str, object],
+) -> None:
+    if not debug_jsonl:
+        return
+
+    try:
+        p = Path(str(debug_jsonl))
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+    except Exception:
+        return
+
+
+def _second_leg_cs_debug_line(
+    *,
+    markets: dict[str, MarketState] | None,
+    outcome_pnls: dict[int, float],
+    frame_index: int | None,
+    pt: int | None,
+    debug_jsonl: str | None,
+) -> str:
+    state = SECOND_LEG_CS_DEBUG_STATE
+
+    if not outcome_pnls:
+        state["state"] = "IDLE"
+        state["reason"] = "-"
+        return "SL: state=IDLE"
+
+    now_pt = int(pt or 0)
+    frame_i = int(frame_index or 0)
+
+    vals = [float(v) for v in outcome_pnls.values()]
+    worst = min(vals)
+    best = max(vals)
+    residual_abs = max(0.0, -worst)
+    max_capital = residual_abs * SECOND_LEG_MAX_CAPITAL_RATIO
+
+    profile_key = _second_leg_profile_key(outcome_pnls)
+    prev_profile_key = state.get("profile_key")
+
+    reason = str(state.get("reason") or "-")
+    package_rebuild_event = False
+
+    if prev_profile_key != profile_key:
+        package_rebuild_event = True
+        state["epoch"] = int(state.get("epoch") or 0) + 1
+        state["profile_key"] = profile_key
+        state["decision_pt"] = now_pt
+        state["place_due_pt"] = now_pt + SECOND_LEG_PLACE_DELAY_MS
+        state["stale_due_pt"] = now_pt + SECOND_LEG_PLACE_DELAY_MS + SECOND_LEG_STALE_AFTER_PLACE_MS
+        state["state"] = "WAITING_PLACE_DELAY"
+        state["reason"] = "FIRST_LEG_CHANGED"
+        reason = "FIRST_LEG_CHANGED"
+    else:
+        place_due = int(state.get("place_due_pt") or 0)
+        stale_due = int(state.get("stale_due_pt") or 0)
+
+        if stale_due and now_pt >= stale_due:
+            package_rebuild_event = True
+            state["epoch"] = int(state.get("epoch") or 0) + 1
+            state["decision_pt"] = now_pt
+            state["place_due_pt"] = now_pt + SECOND_LEG_PLACE_DELAY_MS
+            state["stale_due_pt"] = now_pt + SECOND_LEG_PLACE_DELAY_MS + SECOND_LEG_STALE_AFTER_PLACE_MS
+            state["state"] = "WAITING_PLACE_DELAY"
+            state["reason"] = "STALE_10S_NO_FILL"
+            reason = "STALE_10S_NO_FILL"
+        elif place_due and now_pt >= place_due:
+            state["state"] = "PACKAGE_PLACED_SHADOW"
+            reason = "SHADOW_PACKAGE_ACTIVE"
+        else:
+            state["state"] = "WAITING_PLACE_DELAY"
+            reason = str(state.get("reason") or "WAITING_PLACE_DELAY")
+
+    cs = _second_leg_cs_shadow_summary(markets)
+
+    filled_second_leg_actions = list(state.get("filled_second_leg_actions") or [])
+    filled_totals_greenup_actions = list(state.get("filled_totals_greenup_actions") or [])
+    filled_totals_risk_reduction_actions = list(state.get("filled_totals_risk_reduction_actions") or [])
+
+    second_leg_combined_profile = _second_leg_combined_bucket_profile(
+        markets=markets,
+        outcome_pnls=outcome_pnls,
+        filled_second_leg_actions=filled_second_leg_actions,
+        filled_totals_greenup_actions=filled_totals_greenup_actions,
+        filled_totals_risk_reduction_actions=filled_totals_risk_reduction_actions,
+    )
+
+    second_leg_totals_greenup_preview = _second_leg_totals_greenup_preview(
+        markets=markets,
+        second_leg_combined_profile=second_leg_combined_profile,
+        filled_totals_greenup_actions=filled_totals_greenup_actions,
+        filled_totals_risk_reduction_actions=filled_totals_risk_reduction_actions,
+    )
+
+    totals_greenup_exec: dict[str, object] = {
+        "status": "NONE",
+        "reason": "no_totals_greenup_execution",
+        "actions": [],
+    }
+
+    if str(second_leg_totals_greenup_preview.get("mode") or "") == "TAKER_BACK_TOTALS_GREENUP_PREVIEW":
+        tg_actions = list(second_leg_totals_greenup_preview.get("actions") or [])
+        if tg_actions:
+            raw_action = dict(tg_actions[0])
+            raw_stake = float(raw_action.get("stake", 0.0) or 0.0)
+            raw_greenup = float(raw_action.get("greenup", 0.0) or 0.0)
+            raw_line_greenup = float(raw_action.get("line_greenup_if_full", raw_greenup) or 0.0)
+            raw_worst_improvement = float(raw_action.get("worst_improvement", 0.0) or 0.0)
+
+            if raw_stake <= SECOND_LEG_TOTALS_GREENUP_MIN_EXEC_STAKE:
+                totals_greenup_exec = {
+                    "status": "SKIPPED_ZERO_STAKE",
+                    "reason": "totals_greenup_residual_too_small",
+                    "actions": [raw_action],
+                }
+            elif raw_line_greenup < SECOND_LEG_TOTALS_GREENUP_MIN_GREENUP:
+                totals_greenup_exec = {
+                    "status": "SKIPPED_NEGATIVE_GREENUP",
+                    "reason": "totals_greenup_must_be_positive_only",
+                    "actions": [raw_action],
+                }
+            elif raw_worst_improvement < -SECOND_LEG_PREVIEW_WORST_EPS:
+                totals_greenup_exec = {
+                    "status": "SKIPPED_WORSE_PROFILE",
+                    "reason": "totals_greenup_would_worsen_slc_worst",
+                    "actions": [raw_action],
+                }
+            else:
+                seq = int(state.get("filled_totals_greenup_seq") or 0) + 1
+                state["filled_totals_greenup_seq"] = seq
+
+                tg_action = dict(raw_action)
+                tg_action["seq"] = seq
+                tg_action["frame"] = frame_i
+                tg_action["pt"] = now_pt
+                tg_action["reason"] = "SHADOW_TAKER_TOTALS_GREENUP_EXECUTED"
+
+                filled_totals_greenup_actions = list(state.get("filled_totals_greenup_actions") or [])
+                filled_totals_greenup_actions.append(tg_action)
+                state["filled_totals_greenup_actions"] = filled_totals_greenup_actions
+
+                second_leg_combined_profile = _second_leg_combined_bucket_profile(
+                    markets=markets,
+                    outcome_pnls=outcome_pnls,
+                    filled_second_leg_actions=filled_second_leg_actions,
+                    filled_totals_greenup_actions=filled_totals_greenup_actions,
+                )
+
+                second_leg_totals_greenup_preview = _second_leg_totals_greenup_preview(
+                    markets=markets,
+                    second_leg_combined_profile=second_leg_combined_profile,
+                    filled_totals_greenup_actions=filled_totals_greenup_actions,
+                )
+
+                totals_greenup_exec = {
+                    "status": "EXECUTED_SHADOW",
+                    "reason": "taker_totals_greenup_preview_accepted",
+                    "actions": [tg_action],
+                }
+
+    second_leg_totals_risk_reduction_preview = _second_leg_totals_risk_reduction_preview(
+        markets=markets,
+        second_leg_combined_profile=second_leg_combined_profile,
+        filled_totals_greenup_actions=filled_totals_greenup_actions,
+        filled_totals_risk_reduction_actions=filled_totals_risk_reduction_actions,
+    )
+
+    totals_risk_reduction_exec: dict[str, object] = {
+        "status": "NONE",
+        "reason": "no_totals_risk_reduction_execution",
+        "actions": [],
+    }
+
+    if str(second_leg_totals_risk_reduction_preview.get("mode") or "") == "TAKER_BACK_TOTALS_RISK_REDUCTION_PREVIEW":
+        trr_actions = list(second_leg_totals_risk_reduction_preview.get("actions") or [])
+        slc_w = second_leg_combined_profile.get("worst")
+
+        if trr_actions and slc_w is not None and float(slc_w) < -SECOND_LEG_PREVIEW_WORST_EPS:
+            raw_action = dict(trr_actions[0])
+
+            raw_stake = float(raw_action.get("stake", 0.0) or 0.0)
+            raw_cost = float(raw_action.get("cost", 0.0) or 0.0)
+            raw_imp = float(raw_action.get("worst_improvement", 0.0) or 0.0)
+
+            trr_cost_used_now = sum(
+                float(x.get("cost", 0.0) or 0.0)
+                for x in list(filled_totals_risk_reduction_actions or [])
+            )
+            trr_cost_remaining_now = max(
+                0.0,
+                float(SECOND_LEG_TOTALS_RISK_REDUCTION_MAX_TOTAL_COST) - float(trr_cost_used_now),
+            )
+
+            if raw_stake <= SECOND_LEG_TOTALS_GREENUP_MIN_EXEC_STAKE:
+                totals_risk_reduction_exec = {
+                    "status": "SKIPPED_ZERO_STAKE",
+                    "reason": "totals_risk_reduction_residual_too_small",
+                    "actions": [raw_action],
+                }
+            elif raw_cost > SECOND_LEG_TOTALS_RISK_REDUCTION_MAX_COST + SECOND_LEG_PREVIEW_WORST_EPS:
+                totals_risk_reduction_exec = {
+                    "status": "SKIPPED_COST_CAP",
+                    "reason": "totals_risk_reduction_cost_cap",
+                    "actions": [raw_action],
+                }
+            elif raw_cost > trr_cost_remaining_now + SECOND_LEG_PREVIEW_WORST_EPS:
+                totals_risk_reduction_exec = {
+                    "status": "SKIPPED_TOTAL_COST_BUDGET",
+                    "reason": "totals_risk_reduction_total_cost_budget",
+                    "cost_used": round(float(trr_cost_used_now), 6),
+                    "cost_remaining": round(float(trr_cost_remaining_now), 6),
+                    "max_total_cost": round(float(SECOND_LEG_TOTALS_RISK_REDUCTION_MAX_TOTAL_COST), 6),
+                    "actions": [raw_action],
+                }
+            elif raw_imp < SECOND_LEG_TOTALS_RISK_REDUCTION_MIN_WORST_IMPROVEMENT:
+                totals_risk_reduction_exec = {
+                    "status": "SKIPPED_LOW_IMPROVEMENT",
+                    "reason": "totals_risk_reduction_improvement_too_small",
+                    "actions": [raw_action],
+                }
+            else:
+                seq = int(state.get("filled_totals_risk_reduction_seq") or 0) + 1
+                state["filled_totals_risk_reduction_seq"] = seq
+
+                trr_action = dict(raw_action)
+                trr_action["seq"] = seq
+                trr_action["frame"] = frame_i
+                trr_action["pt"] = now_pt
+                trr_action["reason"] = "SHADOW_TAKER_TOTALS_RISK_REDUCTION_EXECUTED"
+
+                filled_totals_risk_reduction_actions = list(state.get("filled_totals_risk_reduction_actions") or [])
+                filled_totals_risk_reduction_actions.append(trr_action)
+                state["filled_totals_risk_reduction_actions"] = filled_totals_risk_reduction_actions
+
+                second_leg_combined_profile = _second_leg_combined_bucket_profile(
+                    markets=markets,
+                    outcome_pnls=outcome_pnls,
+                    filled_second_leg_actions=filled_second_leg_actions,
+                    filled_totals_greenup_actions=filled_totals_greenup_actions,
+                    filled_totals_risk_reduction_actions=filled_totals_risk_reduction_actions,
+                )
+
+                second_leg_totals_greenup_preview = _second_leg_totals_greenup_preview(
+                    markets=markets,
+                    second_leg_combined_profile=second_leg_combined_profile,
+                    filled_totals_greenup_actions=filled_totals_greenup_actions,
+                    filled_totals_risk_reduction_actions=filled_totals_risk_reduction_actions,
+                )
+
+                second_leg_totals_risk_reduction_preview = _second_leg_totals_risk_reduction_preview(
+                    markets=markets,
+                    second_leg_combined_profile=second_leg_combined_profile,
+                    filled_totals_greenup_actions=filled_totals_greenup_actions,
+                    filled_totals_risk_reduction_actions=filled_totals_risk_reduction_actions,
+                )
+
+                totals_risk_reduction_exec = {
+                    "status": "EXECUTED_SHADOW",
+                    "reason": "paid_totals_risk_reduction_preview_accepted",
+                    "actions": [trr_action],
+                }
+
+    fresh_package_preview = _second_leg_candidate_package_preview(
+        markets=markets,
+        outcome_pnls=outcome_pnls,
+        filled_second_leg_actions=filled_second_leg_actions,
+        filled_totals_greenup_actions=filled_totals_greenup_actions,
+        filled_totals_risk_reduction_actions=filled_totals_risk_reduction_actions,
+    )
+
+    fresh_package_preview = _second_leg_apply_recovery_block_gate(
+        package_preview=fresh_package_preview,
+        second_leg_combined_profile=second_leg_combined_profile,
+        second_leg_totals_greenup_preview=second_leg_totals_greenup_preview,
+        second_leg_totals_risk_reduction_preview=second_leg_totals_risk_reduction_preview,
+        filled_totals_risk_reduction_actions=filled_totals_risk_reduction_actions,
+    )
+
+    # Freeze package per epoch.
+    # In real in-play execution, a package calculated at decision time arrives after delay;
+    # it is not continuously replaced every frame unless a rebuild event starts a new epoch.
+    if state.get("package_preview") is None or package_rebuild_event:
+        state["package_preview"] = fresh_package_preview
+        state["package_decision_frame"] = frame_i
+        state["package_decision_pt"] = now_pt
+
+    package_preview = state.get("package_preview")
+    if not isinstance(package_preview, dict):
+        package_preview = fresh_package_preview
+
+    if (
+        str(state.get("state") or "") == "WAITING_PLACE_DELAY"
+        and _second_leg_package_budget_exhausted(package_preview)
+    ):
+        state["state"] = "BUDGET_BLOCKED_SHADOW"
+        state["reason"] = "SECOND_LEG_BUDGET_EXHAUSTED"
+        state["place_due_pt"] = None
+        state["stale_due_pt"] = None
+        reason = str(state["reason"])
+        sl_state = str(state["state"])
+
+    if (
+        str(state.get("state") or "") == "WAITING_PLACE_DELAY"
+        and _second_leg_package_recovery_blocked(package_preview)
+    ):
+        state["state"] = "RECOVERY_BLOCKED_SHADOW"
+        state["reason"] = "RECOVERY_BLOCKED_NO_RISK_INCREASING_MAKER_BACK"
+        state["place_due_pt"] = None
+        state["stale_due_pt"] = None
+        reason = str(state["reason"])
+        sl_state = str(state["state"])
+
+    package_signal = _second_leg_package_signal(
+        frozen_pkg=package_preview,
+        fresh_pkg=fresh_package_preview,
+    )
+
+    # Shadow auto-rebuild:
+    # If the active frozen package becomes invalid/stale versus fresh market validation,
+    # start a new shadow epoch. This still does NOT place/cancel real orders.
+    sig_name = str(package_signal.get("signal") or "OK")
+    active_package_actions = 0
+    if isinstance(package_preview, dict):
+        active_package_actions = int(package_preview.get("action_count") or 0)
+
+    if (
+        str(state.get("state") or "") == "PACKAGE_PLACED_SHADOW"
+        and sig_name in ("BETTER_FRESH", "FRESH_WORSE", "FRESH_SIZE_CHANGED")
+    ):
+        rebuild_delay_ms = (
+            SECOND_LEG_REBUILD_DELAY_MS
+            if active_package_actions > 0
+            else SECOND_LEG_PLACE_DELAY_MS
+        )
+
+        prev_signal = dict(package_signal)
+
+        state["epoch"] = int(state.get("epoch") or 0) + 1
+        state["decision_pt"] = now_pt
+        state["place_due_pt"] = now_pt + rebuild_delay_ms
+        state["stale_due_pt"] = now_pt + rebuild_delay_ms + SECOND_LEG_STALE_AFTER_PLACE_MS
+        state["state"] = "WAITING_PLACE_DELAY"
+        state["reason"] = "MARKET_REBUILD_" + sig_name
+        state["package_preview"] = fresh_package_preview
+        state["package_decision_frame"] = frame_i
+        state["package_decision_pt"] = now_pt
+
+        reason = str(state["reason"])
+        epoch = int(state.get("epoch") or 0)
+        sl_state = str(state.get("state") or "IDLE")
+        package_preview = fresh_package_preview
+
+        package_signal = {
+            "signal": "REBUILD_TRIGGERED",
+            "reason": "active_package_invalidated_by_fresh_signal",
+            "trigger": prev_signal,
+            "rebuild_delay_ms": rebuild_delay_ms,
+            "active_package_actions": active_package_actions,
+        }
+
+    shadow_fill = _second_leg_shadow_fill_probe(
+        markets=markets,
+        package_preview=package_preview,
+        active=str(state.get("state") or "") == "PACKAGE_PLACED_SHADOW",
+    )
+
+    if str(shadow_fill.get("status") or "") in ("PARTIAL_SIGNAL", "FULL_SIGNAL"):
+        new_filled_actions: list[dict[str, object]] = []
+
+        for fill in list(shadow_fill.get("fills") or []):
+            try:
+                fill_stake = float(fill.get("fill_size") or 0.0)
+                fill_price = float(fill.get("price") or 0.0)
+            except Exception:
+                continue
+
+            if fill_stake <= 1e-9 or fill_price <= 1.0:
+                continue
+
+            seq = int(state.get("filled_second_leg_seq") or 0) + 1
+            state["filled_second_leg_seq"] = seq
+
+            new_filled_actions.append(
+                {
+                    "seq": seq,
+                    "frame": frame_i,
+                    "pt": now_pt,
+                    "mode": "TAKER_SIGNAL" if fill.get("fill_reason") == "PRICE_CROSSED_BY_BEST_LAY" else "MAKER_SIGNAL",
+                    "side": "BACK",
+                    "runner": str(fill.get("runner") or ""),
+                    "price": round(fill_price, 6),
+                    "stake": round(fill_stake, 6),
+                    "reason": str(fill.get("fill_reason") or ""),
+                }
+            )
+
+        if new_filled_actions:
+            filled_second_leg_actions = list(state.get("filled_second_leg_actions") or [])
+            filled_second_leg_actions.extend(new_filled_actions)
+            state["filled_second_leg_actions"] = filled_second_leg_actions
+
+            fresh_package_preview = _second_leg_candidate_package_preview(
+                markets=markets,
+                outcome_pnls=outcome_pnls,
+                filled_second_leg_actions=filled_second_leg_actions,
+                filled_totals_greenup_actions=filled_totals_greenup_actions,
+                filled_totals_risk_reduction_actions=filled_totals_risk_reduction_actions,
+            )
+
+            state["epoch"] = int(state.get("epoch") or 0) + 1
+            state["decision_pt"] = now_pt
+            state["place_due_pt"] = now_pt + SECOND_LEG_REBUILD_DELAY_MS
+            state["stale_due_pt"] = now_pt + SECOND_LEG_REBUILD_DELAY_MS + SECOND_LEG_STALE_AFTER_PLACE_MS
+            state["state"] = "WAITING_PLACE_DELAY"
+            state["reason"] = "SECOND_LEG_FILL_REBUILD"
+            state["package_preview"] = fresh_package_preview
+            state["package_decision_frame"] = frame_i
+            state["package_decision_pt"] = now_pt
+
+            reason = str(state["reason"])
+            epoch = int(state.get("epoch") or 0)
+            sl_state = str(state.get("state") or "IDLE")
+            package_preview = fresh_package_preview
+
+            filled_totals_greenup_actions = list(state.get("filled_totals_greenup_actions") or [])
+            filled_totals_risk_reduction_actions = list(state.get("filled_totals_risk_reduction_actions") or [])  # fill_rebuild_trr_budget_pass_fix_marker
+
+            second_leg_combined_profile = _second_leg_combined_bucket_profile(
+                markets=markets,
+                outcome_pnls=outcome_pnls,
+                filled_second_leg_actions=filled_second_leg_actions,
+                filled_totals_greenup_actions=filled_totals_greenup_actions,
+                filled_totals_risk_reduction_actions=filled_totals_risk_reduction_actions,
+            )
+            second_leg_totals_greenup_preview = _second_leg_totals_greenup_preview(
+                markets=markets,
+                second_leg_combined_profile=second_leg_combined_profile,
+                filled_totals_greenup_actions=filled_totals_greenup_actions,
+                filled_totals_risk_reduction_actions=filled_totals_risk_reduction_actions,
+            )
+            second_leg_totals_risk_reduction_preview = _second_leg_totals_risk_reduction_preview(
+                markets=markets,
+                second_leg_combined_profile=second_leg_combined_profile,
+                filled_totals_greenup_actions=filled_totals_greenup_actions,
+                filled_totals_risk_reduction_actions=filled_totals_risk_reduction_actions,
+            )
+
+            package_signal = {
+                "signal": "FILL_REBUILD_TRIGGERED",
+                "reason": "second_leg_shadow_fill_signal",
+                "new_filled_actions": new_filled_actions,
+                "rebuild_delay_ms": SECOND_LEG_REBUILD_DELAY_MS,
+            }
+
+    place_due = int(state.get("place_due_pt") or 0)
+    stale_due = int(state.get("stale_due_pt") or 0)
+
+    place_in = None
+    stale_in = None
+    if place_due:
+        place_in = max(0.0, (place_due - now_pt) / 1000.0)
+    if stale_due and now_pt >= place_due:
+        stale_in = max(0.0, (stale_due - now_pt) / 1000.0)
+
+    epoch = int(state.get("epoch") or 0)
+    sl_state = str(state.get("state") or "IDLE")
+
+    compact_log_key = (epoch, sl_state, reason)
+    if state.get("last_logged_key") != compact_log_key:
+        state["last_logged_key"] = compact_log_key
+        _second_leg_debug_write_jsonl(
+            debug_jsonl=debug_jsonl,
+            payload={
+                "type": "second_leg_shadow",
+                "frame": frame_i,
+                "pt": now_pt,
+                "utc": format_pt(now_pt) if now_pt else None,
+                "epoch": epoch,
+                "state": sl_state,
+                "reason": reason,
+                "worst": worst,
+                "best": best,
+                "residual_abs": residual_abs,
+                "max_capital": max_capital,
+                "place_due_pt": state.get("place_due_pt"),
+                "stale_due_pt": state.get("stale_due_pt"),
+                "cs": cs,
+                "package_preview": package_preview,
+                "fresh_package_preview": fresh_package_preview,
+                "package_compact": _second_leg_compact_package(package_preview),
+                "fresh_package_compact": _second_leg_compact_package(fresh_package_preview),
+                "package_signal": package_signal,
+                "shadow_fill": shadow_fill,
+                "filled_second_leg": _second_leg_compact_filled_actions(filled_second_leg_actions),
+                "second_leg_combined_profile": second_leg_combined_profile,
+                "second_leg_totals_greenup_preview": second_leg_totals_greenup_preview,
+                "second_leg_totals_risk_reduction_preview": second_leg_totals_risk_reduction_preview,
+                "second_leg_recovery_preview": _second_leg_cs_recovery_preview(
+                    markets=markets,
+                    second_leg_combined_profile=second_leg_combined_profile,
+                ),
+                "totals_risk_reduction_exec": totals_risk_reduction_exec,
+                "filled_totals_risk_reduction": _second_leg_compact_totals_risk_reduction_actions(filled_totals_risk_reduction_actions),
+                "totals_greenup_exec": totals_greenup_exec,
+                "filled_totals_greenup": _second_leg_compact_totals_greenup_actions(filled_totals_greenup_actions),
+                "package_decision_frame": state.get("package_decision_frame"),
+                "package_decision_pt": state.get("package_decision_pt"),
+                "outcome": {
+                    ("G9+" if int(k) == 9 else f"G{int(k)}"): float(v)
+                    for k, v in sorted(outcome_pnls.items())
+                },
+            },
+        )
+
+    place_txt = "-" if place_in is None else f"{place_in:.0f}s"
+    stale_txt = "-" if stale_in is None else f"{stale_in:.0f}s"
+
+    pkg_mode = str(package_preview.get("mode") or "-")
+    pkg_actions = int(package_preview.get("action_count") or 0)
+    pkg_capital = float(package_preview.get("capital") or 0.0)
+    pkg_worst_if_full = package_preview.get("worst_if_full")
+    pkg_worst_txt = "-" if pkg_worst_if_full is None else f"{float(pkg_worst_if_full):+.2f}"
+    pkg_signal_txt = str(package_signal.get("signal") or "-")
+    fill_status_txt = str(shadow_fill.get("status") or "-")
+    fill_actions_txt = int(shadow_fill.get("filled_actions") or 0)
+    fill_stake_txt = float(shadow_fill.get("filled_stake") or 0.0)
+    filled_second_leg_stake_txt = sum(
+        float(x.get("stake", 0.0) or 0.0)
+        for x in list(filled_second_leg_actions or [])
+    )
+    filled_second_leg_count_txt = len(list(filled_second_leg_actions or []))
+    filled_totals_greenup_stake_txt = sum(
+        float(x.get("stake", 0.0) or 0.0)
+        for x in list(filled_totals_greenup_actions or [])
+    )
+    filled_totals_greenup_count_txt = len(list(filled_totals_greenup_actions or []))
+    filled_totals_greenup_greenup_txt = sum(
+        float(x.get("greenup", 0.0) or 0.0)
+        for x in list(filled_totals_greenup_actions or [])
+    )
+    tg_exec_status_txt = str(totals_greenup_exec.get("status") or "-")
+    trr_mode_txt = str(second_leg_totals_risk_reduction_preview.get("mode") or "-")
+    trr_actions_txt = int(second_leg_totals_risk_reduction_preview.get("action_count") or 0)
+    trr_cost = second_leg_totals_risk_reduction_preview.get("cost")
+    trr_imp = second_leg_totals_risk_reduction_preview.get("worst_improvement")
+    trr_cost_txt = "-" if trr_cost is None else f"{float(trr_cost):.2f}"
+    trr_imp_txt = "-" if trr_imp is None else f"{float(trr_imp):+.2f}"
+    trr_exec_status_txt = str(totals_risk_reduction_exec.get("status") or "-")
+    filled_totals_risk_reduction_count_txt = len(list(filled_totals_risk_reduction_actions or []))
+    filled_totals_risk_reduction_stake_txt = sum(
+        float(x.get("stake", 0.0) or 0.0)
+        for x in list(filled_totals_risk_reduction_actions or [])
+    )
+    filled_totals_risk_reduction_cost_txt = sum(
+        float(x.get("cost", 0.0) or 0.0)
+        for x in list(filled_totals_risk_reduction_actions or [])
+    )
+    slc_worst = second_leg_combined_profile.get("worst")
+    slc_best = second_leg_combined_profile.get("best")
+    slc_drop = second_leg_combined_profile.get("worst_drop_from_first_leg")
+    slc_worst_txt = "-" if slc_worst is None else f"{float(slc_worst):+.2f}"
+    slc_best_txt = "-" if slc_best is None else f"{float(slc_best):+.2f}"
+    slc_drop_txt = "-" if slc_drop is None else f"{float(slc_drop):.2f}"
+    tg_mode_txt = str(second_leg_totals_greenup_preview.get("mode") or "-")
+    tg_actions_txt = int(second_leg_totals_greenup_preview.get("action_count") or 0)
+    tg_greenup = second_leg_totals_greenup_preview.get("greenup")
+    tg_imp = second_leg_totals_greenup_preview.get("worst_improvement")
+    tg_greenup_txt = "-" if tg_greenup is None else f"{float(tg_greenup):+.2f}"
+    tg_imp_txt = "-" if tg_imp is None else f"{float(tg_imp):+.2f}"
+
+    state_short = {
+        "WAITING_PLACE_DELAY": "WAIT",
+        "PACKAGE_PLACED_SHADOW": "PLACED",
+        "BUDGET_BLOCKED_SHADOW": "BLOCK",
+        "RECOVERY_BLOCKED_SHADOW": "RBLOCK",
+        "IDLE": "IDLE",
+    }.get(sl_state, sl_state)
+
+    reason_short = {
+        "FIRST_LEG_CHANGED": "FL",
+        "STALE_10S_NO_FILL": "STALE",
+        "SHADOW_PACKAGE_ACTIVE": "ACTIVE",
+        "WAITING_PLACE_DELAY": "WAIT",
+    }.get(reason, reason)
+
+    return (
+        f"SL ep={epoch} {state_short}/{reason_short} "
+        f"w={worst:+.2f} cap={max_capital:.0f} "
+        f"PKG={pkg_mode}:{pkg_actions} pc={pkg_capital:.2f} wf={pkg_worst_txt} "
+        f"sig={pkg_signal_txt} fill={fill_status_txt}:{fill_actions_txt}/{fill_stake_txt:.2f} "
+        f"slf={filled_second_leg_count_txt}/{filled_second_leg_stake_txt:.2f} "
+        f"SLC={slc_worst_txt}/{slc_best_txt}/d{slc_drop_txt} "
+        f"TG={tg_mode_txt}:{tg_actions_txt}/g{tg_greenup_txt}/w{tg_imp_txt} "
+        f"tgf={filled_totals_greenup_count_txt}/{filled_totals_greenup_stake_txt:.2f}/g{filled_totals_greenup_greenup_txt:.2f}/{tg_exec_status_txt} "
+        f"TRR={trr_mode_txt}:{trr_actions_txt}/c{trr_cost_txt}/w{trr_imp_txt}/{trr_exec_status_txt} "
+        f"trrf={filled_totals_risk_reduction_count_txt}/{filled_totals_risk_reduction_stake_txt:.2f}/c{filled_totals_risk_reduction_cost_txt:.2f} "
+        f"df={state.get('package_decision_frame')} "
+        f"CS={int(cs['runners'])}/{int(cs['two_sided'])} "
+        f"MB={int(cs['maker_back_candidates'])} "
+        f"TB={int(cs['taker_back_candidates'])} "
+        f"L<={SECOND_LEG_CS_LAY_MAX_PRICE:g}:{int(cs['safe_lay_candidates'])} "
+        f"p={place_txt} s={stale_txt}"
+    )
+
+
 def _set_clean_maker_overlay_before_render(
     balance: float | None,
     enabled: bool,
     markets: dict[str, MarketState] | None = None,
+    second_leg_debug: bool = False,
+    frame_index: int | None = None,
+    pt: int | None = None,
+    second_leg_debug_jsonl: str | None = None,
 ) -> None:
     global ENGINE_V2_OVERLAY_LINE
     global ENGINE_V2_TAPE_LINE
@@ -3600,7 +6927,23 @@ def _set_clean_maker_overlay_before_render(
         + f" maker_liability={open_liability:.2f}"
     )
 
-    ENGINE_V2_TAPE_LINE = _maker_under_lay_grid_outcome_line(outcome_pnls)
+    outcome_line = _maker_under_lay_grid_outcome_line(outcome_pnls)
+    second_leg_line = ""
+    if second_leg_debug:
+        second_leg_line = _second_leg_cs_debug_line(
+            markets=markets,
+            outcome_pnls=outcome_pnls,
+            frame_index=frame_index,
+            pt=pt,
+            debug_jsonl=second_leg_debug_jsonl,
+        )
+
+    if outcome_line and second_leg_line:
+        ENGINE_V2_TAPE_LINE = outcome_line + " || " + second_leg_line
+    elif second_leg_line:
+        ENGINE_V2_TAPE_LINE = second_leg_line
+    else:
+        ENGINE_V2_TAPE_LINE = outcome_line
 
 def stream_replay(args: argparse.Namespace) -> int:
     if not args.replay_file.exists():
@@ -3986,7 +7329,15 @@ def stream_replay(args: argparse.Namespace) -> int:
                         )
                         print(json.dumps(payload, ensure_ascii=False))
                     else:
-	                        _set_clean_maker_overlay_before_render(balance, bool(getattr(args, "engine_v2_overlay", False)), markets=markets)
+	                        _set_clean_maker_overlay_before_render(
+	                            balance,
+	                            bool(getattr(args, "engine_v2_overlay", False)),
+	                            markets=markets,
+	                            second_leg_debug=bool(getattr(args, "second_leg_cs_debug", False)),
+	                            frame_index=frames,
+	                            pt=int(next_frame_pt) if next_frame_pt is not None else None,
+	                            second_leg_debug_jsonl=str(getattr(args, "second_leg_debug_jsonl", "")),
+	                        )
 	                        render_dashboard(
 	                            pt=next_frame_pt,
 	                            markets=markets,
@@ -4115,7 +7466,15 @@ def stream_replay(args: argparse.Namespace) -> int:
                                 hist_i = idx
                                 _rebuild_maker_grid_to_history_index(hist_i)
                                 interactive_err = None
-                                _set_clean_maker_overlay_before_render(balance, bool(getattr(args, "engine_v2_overlay", False)), markets=markets)
+                                _set_clean_maker_overlay_before_render(
+                                    balance,
+                                    bool(getattr(args, "engine_v2_overlay", False)),
+                                    markets=markets,
+                                    second_leg_debug=bool(getattr(args, "second_leg_cs_debug", False)),
+                                    frame_index=frames,
+                                    pt=int(next_frame_pt) if next_frame_pt is not None else None,
+                                    second_leg_debug_jsonl=str(getattr(args, "second_leg_debug_jsonl", "")),
+                                )
                                 render_dashboard(
                                     pt=int(s.frame_pt),
                                     markets=markets,
