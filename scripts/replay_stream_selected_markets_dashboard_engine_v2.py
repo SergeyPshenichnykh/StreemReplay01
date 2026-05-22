@@ -7146,6 +7146,11 @@ def _second_leg_cs_debug_line(
 
             raw_recovery_actions.append(dict(a))
 
+        maker_recovery_actions = [
+            a for a in raw_recovery_actions
+            if str(a.get("mode") or "").upper() == "MAKER"
+        ]
+
         recovery_capital = sum(float(a.get("stake", 0.0) or 0.0) for a in raw_recovery_actions)
         existing_recovery_capital = sum(
             float(a.get("stake", 0.0) or 0.0)
@@ -7161,6 +7166,17 @@ def _second_leg_cs_debug_line(
                 "reason": "recovery_preview_has_no_valid_back_actions",
                 "mode": recovery_mode,
                 "actions": [],
+            }
+        elif maker_recovery_actions:
+            second_leg_recovery_exec = {
+                "status": "WAITING_MAKER_FILL",
+                "reason": "recovery_package_has_maker_fallback_wait_for_queue_model",
+                "mode": recovery_mode,
+                "maker_action_count": len(maker_recovery_actions),
+                "taker_action_count": len(raw_recovery_actions) - len(maker_recovery_actions),
+                "capital": round(float(recovery_capital), 6),
+                "actions": raw_recovery_actions,
+                "maker_actions": maker_recovery_actions,
             }
         elif preview_worst_improvement <= SECOND_LEG_PREVIEW_WORST_EPS:
             second_leg_recovery_exec = {
