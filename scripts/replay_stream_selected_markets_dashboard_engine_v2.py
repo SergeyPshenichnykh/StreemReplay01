@@ -3601,6 +3601,12 @@ SECOND_LEG_CS_MAKER_LAY_RECOVERY_MIN_WORST_IMPROVEMENT = 0.005
 SECOND_LEG_CS_TAKER_BACK_RECOVERY_MAX_STAKE = 0.25
 SECOND_LEG_CS_TAKER_BACK_RECOVERY_MIN_WORST_IMPROVEMENT = 0.005
 SECOND_LEG_CS_TAKER_BACK_RECOVERY_MAX_STAKE_LOSS = 0.25
+
+SECOND_LEG_CS_BACK_BUCKET_RECOVERY_MAX_CAPITAL = 2.00
+SECOND_LEG_CS_BACK_BUCKET_RECOVERY_TARGET_IMPROVEMENT = 0.25
+SECOND_LEG_CS_BACK_BUCKET_RECOVERY_MIN_WORST_IMPROVEMENT = 0.005
+SECOND_LEG_CS_BACK_BUCKET_RECOVERY_MIN_ACTION_STAKE = 0.0001
+SECOND_LEG_CS_RECOVERY_SHADOW_MAX_TOTAL_CAPITAL = 20.00
 SECOND_LEG_MAX_CAPITAL_RATIO = 20.0
 SECOND_LEG_PLACE_DELAY_MS = 5000
 SECOND_LEG_REBUILD_DELAY_MS = 10000
@@ -6002,6 +6008,507 @@ def _second_leg_cs_taker_back_recovery_preview(
     }
 
 
+
+def _second_leg_bucket_name_from_goals(goals: int) -> str:
+    return "G9+" if int(goals) >= 9 else f"G{int(goals)}"
+
+
+def _second_leg_runner_exact_goal_bucket(runner_name: str) -> str | None:
+    s = str(runner_name or "").strip()
+    if " - " not in s:
+        return None
+
+    parts = s.split(" - ", 1)
+    if len(parts) != 2:
+        return None
+
+    try:
+        a = int(parts[0].strip())
+        b = int(parts[1].strip())
+    except Exception:
+        return None
+
+    return _second_leg_bucket_name_from_goals(a + b)
+
+
+def _second_leg_virtual_row_runner(row: dict[str, object]) -> str | None:
+    for key in ("runner", "runner_name", "name", "selection_name"):
+        v = row.get(key)
+        if v:
+            return str(v)
+    return None
+
+
+def _second_leg_virtual_row_buckets(row: dict[str, object]) -> list[str]:
+    for key in ("buckets", "mapped_buckets", "bucket_names", "goal_buckets"):
+        v = row.get(key)
+        if isinstance(v, (list, tuple, set)):
+            out = [str(x) for x in v if str(x)]
+            if out:
+                return out
+
+    for key in ("bucket", "goal_bucket", "bucket_name"):
+        v = row.get(key)
+        if v is None:
+            continue
+
+        if isinstance(v, str):
+            vv = v.strip()
+            if vv.startswith("G"):
+                return [vv]
+            try:
+                return [_second_leg_bucket_name_from_goals(int(float(vv)))]
+            except Exception:
+                pass
+
+        try:
+            return [_second_leg_bucket_name_from_goals(int(v))]
+        except Exception:
+            pass
+
+    runner = _second_leg_virtual_row_runner(row)
+    bucket = _second_leg_runner_exact_goal_bucket(str(runner or ""))
+    return [bucket] if bucket else []
+
+
+def _second_leg_find_cs_runner_price(
+    *,
+    markets: dict[str, MarketState] | None,
+    runner_name: str,
+    side: str,
+) -> tuple[float, float] | None:
+    target = str(runner_name)
+
+    for st in (markets or {}).values():
+        if st is None or not is_correct_score(st):
+            continue
+
+        for r in st.runners.values():
+            if str(r.name or r.selection_id) != target:
+                continue
+
+            if str(side).upper() == "BACK":
+                lvl = best_level(r.available_to_lay, side="LAY")
+            else:
+                lvl = best_level(r.available_to_back, side="BACK")
+
+            if lvl is None:
+                return None
+
+            try:
+                return float(lvl[0]), float(lvl[1])
+            except Exception:
+                return None
+
+    return None
+
+
+def _second_leg_cs_back_bucket_recovery_package_preview(
+    *,
+    markets: dict[str, MarketState] | None,
+    second_leg_combined_profile: dict[str, object],
+) -> dict[str, object]:
+    """
+    Read-only CS BACK bucket recovery package preview v0.
+
+    Finds the bucket currently driving SLC worst and tries to BACK all CS
+    runners mapped to that bucket as one taker dutch package.
+
+    Does NOT execute.
+    Does NOT mutate state.
+    """
+    profile = second_leg_combined_profile.get("profile")
+    if not isinstance(profile, dict) or not profile:
+        return {
+            "mode": "NO_CS_BACK_BUCKET_RECOVERY",
+            "reason": "missing_combined_profile",
+            "actions": [],
+            "action_count": 0,
+        }
+
+    base_bucket = {str(k): float(v) for k, v in profile.items()}
+    current_worst = min(base_bucket.values())
+    current_best = max(base_bucket.values())
+
+    if current_worst >= -SECOND_LEG_PREVIEW_WORST_EPS:
+        return {
+            "mode": "NO_CS_BACK_BUCKET_RECOVERY",
+            "reason": "slc_worst_not_negative",
+            "actions": [],
+            "action_count": 0,
+            "current_worst": round(float(current_worst), 6),
+            "current_best": round(float(current_best), 6),
+        }
+
+    true_worst_buckets = [
+        str(k)
+        for k, v in base_bucket.items()
+        if float(v) <= float(current_worst) + SECOND_LEG_PREVIEW_WORST_EPS
+    ]
+
+    # Guard-band:
+    # BACKing only the exact worst bucket can improve that bucket but push nearby
+    # buckets below it because BACK loses stake on all non-selected outcomes.
+    # Therefore, cover all buckets that are close enough to become the next worst
+    # within the max package capital.
+    worst_buckets = [
+        str(k)
+        for k, v in base_bucket.items()
+        if float(v) <= (
+            float(current_worst)
+            + float(SECOND_LEG_CS_BACK_BUCKET_RECOVERY_MAX_CAPITAL)
+            + SECOND_LEG_PREVIEW_WORST_EPS
+        )
+    ] or list(true_worst_buckets)
+
+    virtual_rows = _second_leg_cs_virtual_rows(markets)
+    target_runners: dict[str, dict[str, object]] = {}
+
+    for row in virtual_rows:
+        if not isinstance(row, dict):
+            continue
+
+        runner = _second_leg_virtual_row_runner(row)
+        if not runner:
+            continue
+
+        buckets = _second_leg_virtual_row_buckets(row)
+        if not buckets:
+            continue
+
+        if any(b in worst_buckets for b in buckets):
+            target_runners[str(runner)] = {
+                "runner": str(runner),
+                "buckets": buckets,
+            }
+
+    if not target_runners:
+        return {
+            "mode": "NO_CS_BACK_BUCKET_RECOVERY",
+            "reason": "no_virtual_runners_for_worst_buckets",
+            "actions": [],
+            "action_count": 0,
+            "current_worst": round(float(current_worst), 6),
+            "current_best": round(float(current_best), 6),
+            "worst_buckets": worst_buckets,
+            "virtual_row_count": len(virtual_rows),
+        }
+
+    priced: list[dict[str, object]] = []
+    missing: list[str] = []
+    maker_fallback_count = 0
+    taker_count = 0
+
+    for runner, meta in sorted(target_runners.items()):
+        px = _second_leg_find_cs_runner_price(
+            markets=markets,
+            runner_name=runner,
+            side="BACK",
+        )
+
+        execution = "TAKER"
+        queue_ahead = 0.0
+
+        if px is None:
+            # Fallback: if there is no taker BACK price, preview a MAKER BACK
+            # at current best BACK. This is still read-only and assumes full fill
+            # only for feasibility diagnostics.
+            px = _second_leg_find_cs_runner_price(
+                markets=markets,
+                runner_name=runner,
+                side="MAKER_BACK",
+            )
+            execution = "MAKER"
+
+        if px is None:
+            missing.append(runner)
+            continue
+
+        price, avail = px
+        if price <= 1.0:
+            missing.append(runner)
+            continue
+
+        if execution == "TAKER":
+            if avail <= SECOND_LEG_TOTALS_GREENUP_MIN_EXEC_STAKE:
+                missing.append(runner)
+                continue
+            usable_available = float(avail)
+            taker_count += 1
+        else:
+            # For maker fallback, `avail` means queue ahead, not taker liquidity.
+            # Do not cap stake by queue ahead in preview.
+            queue_ahead = float(avail)
+            usable_available = float(SECOND_LEG_CS_BACK_BUCKET_RECOVERY_MAX_CAPITAL)
+            maker_fallback_count += 1
+
+        priced.append(
+            {
+                "runner": runner,
+                "buckets": meta.get("buckets") or [],
+                "price": float(price),
+                "available": float(usable_available),
+                "queue_ahead": float(queue_ahead),
+                "execution": execution,
+            }
+        )
+
+    if missing:
+        return {
+            "mode": "NO_CS_BACK_BUCKET_RECOVERY",
+            "reason": "missing_taker_or_maker_back_price_for_worst_bucket_runner",
+            "actions": [],
+            "action_count": 0,
+            "current_worst": round(float(current_worst), 6),
+            "current_best": round(float(current_best), 6),
+            "worst_buckets": worst_buckets,
+            "true_worst_buckets": true_worst_buckets,
+            "target_count": len(target_runners),
+            "priced_count": len(priced),
+            "taker_count": taker_count,
+            "maker_fallback_count": maker_fallback_count,
+            "missing": missing[:30],
+        }
+
+    inv_sum = sum(1.0 / float(x["price"]) for x in priced)
+
+    if inv_sum >= 1.0 - 1e-12:
+        return {
+            "mode": "NO_CS_BACK_BUCKET_RECOVERY",
+            "reason": "worst_bucket_back_dutch_not_positive",
+            "actions": [],
+            "action_count": 0,
+            "current_worst": round(float(current_worst), 6),
+            "current_best": round(float(current_best), 6),
+            "worst_buckets": worst_buckets,
+            "true_worst_buckets": true_worst_buckets,
+            "target_count": len(target_runners),
+            "priced_count": len(priced),
+            "inv_sum": round(float(inv_sum), 6),
+        }
+
+    # global_safe_sizing_grid_v1
+    #
+    # Previous version sized only against the worst bucket. That can still worsen
+    # the global SLC because every BACK action loses stake on all non-selected
+    # virtual outcomes. Here we search package capital directly and accept only
+    # if the GLOBAL bucket-worst improves.
+    max_capital = float(SECOND_LEG_CS_BACK_BUCKET_RECOVERY_MAX_CAPITAL)
+
+    weights: list[dict[str, object]] = []
+    for x in priced:
+        price = float(x["price"])
+        weight = (1.0 / price) / max(inv_sum, 1e-12)
+        weights.append(
+            {
+                "runner": str(x["runner"]),
+                "buckets": list(x.get("buckets") or []),
+                "price": price,
+                "available": float(x.get("available", 0.0) or 0.0),
+                "queue_ahead": float(x.get("queue_ahead", 0.0) or 0.0),
+                "execution": str(x.get("execution") or "TAKER"),
+                "weight": float(weight),
+            }
+        )
+
+    max_capital_by_liquidity = max_capital
+    for x in weights:
+        w = float(x["weight"])
+        if w <= 1e-12:
+            continue
+        max_capital_by_liquidity = min(
+            max_capital_by_liquidity,
+            float(x["available"]) / w,
+        )
+
+    max_search_capital = min(float(max_capital), float(max_capital_by_liquidity))
+
+    if max_search_capital <= SECOND_LEG_TOTALS_GREENUP_MIN_EXEC_STAKE:
+        return {
+            "mode": "NO_CS_BACK_BUCKET_RECOVERY",
+            "reason": "global_safe_liquidity_cap_too_small",
+            "actions": [],
+            "action_count": 0,
+            "current_worst": round(float(current_worst), 6),
+            "current_best": round(float(current_best), 6),
+            "worst_buckets": worst_buckets,
+            "inv_sum": round(float(inv_sum), 6),
+            "max_capital": round(float(max_capital), 6),
+            "max_search_capital": round(float(max_search_capital), 6),
+        }
+
+    def _build_actions(total_capital: float) -> list[dict[str, object]]:
+        out: list[dict[str, object]] = []
+        for x in weights:
+            stake = float(total_capital) * float(x["weight"])
+            if stake <= SECOND_LEG_CS_BACK_BUCKET_RECOVERY_MIN_ACTION_STAKE:
+                return []
+
+            out.append(
+                {
+                    "mode": str(x["execution"]),
+                    "side": "BACK",
+                    "runner": str(x["runner"]),
+                    "buckets": list(x.get("buckets") or []),
+                    "price": round(float(x["price"]), 6),
+                    "stake": round(float(stake), 6),
+                    "available": round(float(x["available"]), 6),
+                    "queue_ahead": round(float(x.get("queue_ahead", 0.0) or 0.0), 6),
+                }
+            )
+        return out
+
+    best_actions: list[dict[str, object]] = []
+    best_profile: dict[str, float] | None = None
+    best_capital = 0.0
+    best_worst = float(current_worst)
+    best_best = float(current_best)
+    best_probe = None
+
+    best_failed_actions: list[dict[str, object]] = []
+    best_failed_profile: dict[str, float] | None = None
+    best_failed_capital = 0.0
+    best_failed_worst = -10**18
+    best_failed_best = float(current_best)
+    best_failed_probe = None
+
+    # Coarse grid is enough for preview. It avoids false positives from a
+    # package that improves one bucket but damages another.
+    grid_points = 200
+    for i in range(1, grid_points + 1):
+        capital_probe = float(max_search_capital) * float(i) / float(grid_points)
+        actions_probe = _build_actions(capital_probe)
+        if not actions_probe:
+            continue
+
+        trial = _second_leg_apply_back_preview(
+            virtual_rows=virtual_rows,
+            base_bucket=base_bucket,
+            package=actions_probe,
+        )
+
+        if not trial:
+            continue
+
+        trial_worst = min(float(v) for v in trial.values())
+        trial_best = max(float(v) for v in trial.values())
+
+        if trial_worst > best_failed_worst + SECOND_LEG_PREVIEW_WORST_EPS:
+            best_failed_actions = actions_probe
+            best_failed_profile = trial
+            best_failed_capital = capital_probe
+            best_failed_worst = trial_worst
+            best_failed_best = trial_best
+            best_failed_probe = i
+
+        # Maximize global worst. Tie-breaker: lower capital.
+        if (
+            trial_worst > best_worst + SECOND_LEG_PREVIEW_WORST_EPS
+            or (
+                abs(trial_worst - best_worst) <= SECOND_LEG_PREVIEW_WORST_EPS
+                and best_profile is not None
+                and capital_probe < best_capital
+            )
+        ):
+            best_actions = actions_probe
+            best_profile = trial
+            best_capital = capital_probe
+            best_worst = trial_worst
+            best_best = trial_best
+            best_probe = i
+
+    if best_profile is None:
+        failed_profile_out = {}
+        failed_worst_buckets = []
+        if isinstance(best_failed_profile, dict):
+            failed_profile_out = {k: round(float(v), 6) for k, v in best_failed_profile.items()}
+            if failed_profile_out:
+                bw = min(float(v) for v in failed_profile_out.values())
+                failed_worst_buckets = [
+                    str(k) for k, v in failed_profile_out.items()
+                    if float(v) <= bw + SECOND_LEG_PREVIEW_WORST_EPS
+                ]
+
+        return {
+            "mode": "NO_CS_BACK_BUCKET_RECOVERY",
+            "reason": "global_safe_bucket_package_no_positive_worst_probe",
+            "actions": [],
+            "action_count": 0,
+            "current_worst": round(float(current_worst), 6),
+            "current_best": round(float(current_best), 6),
+            "current_profile": {k: round(float(v), 6) for k, v in base_bucket.items()},
+            "worst_buckets": worst_buckets,
+            "target_count": len(target_runners),
+            "priced_count": len(priced),
+            "taker_count": taker_count,
+            "maker_fallback_count": maker_fallback_count,
+            "inv_sum": round(float(inv_sum), 6),
+            "max_capital": round(float(max_capital), 6),
+            "max_search_capital": round(float(max_search_capital), 6),
+            "probe_count": grid_points,
+            "best_failed_probe": best_failed_probe,
+            "best_failed_capital": round(float(best_failed_capital), 6),
+            "best_failed_worst": round(float(best_failed_worst), 6),
+            "best_failed_best": round(float(best_failed_best), 6),
+            "best_failed_worst_improvement": round(float(best_failed_worst - current_worst), 6),
+            "best_failed_worst_buckets": failed_worst_buckets,
+            "best_failed_probe_profile": failed_profile_out,
+            "best_failed_actions": best_failed_actions[:20],
+        }
+
+    actions = best_actions
+    trial_profile = best_profile
+    worst_if_full = float(best_worst)
+    best_if_full = float(best_best)
+    worst_improvement = float(worst_if_full) - float(current_worst)
+    capital = sum(float(a.get("stake", 0.0) or 0.0) for a in actions)
+
+    worst_if_full = min(float(v) for v in trial_profile.values())
+    best_if_full = max(float(v) for v in trial_profile.values())
+    worst_improvement = float(worst_if_full) - float(current_worst)
+    capital = sum(float(a.get("stake", 0.0) or 0.0) for a in actions)
+
+    if worst_improvement < SECOND_LEG_CS_BACK_BUCKET_RECOVERY_MIN_WORST_IMPROVEMENT:
+        return {
+            "mode": "NO_CS_BACK_BUCKET_RECOVERY",
+            "reason": "package_does_not_improve_bucket_worst",
+            "actions": actions[:20],
+            "action_count": len(actions),
+            "capital": round(float(capital), 6),
+            "current_worst": round(float(current_worst), 6),
+            "worst_if_full": round(float(worst_if_full), 6),
+            "worst_improvement": round(float(worst_improvement), 6),
+            "worst_buckets": worst_buckets,
+            "inv_sum": round(float(inv_sum), 6),
+            "scale": 1.0,  # global_safe_sizing_grid_v1 fixed legacy scale field
+            "profile_if_full": {k: round(float(v), 6) for k, v in trial_profile.items()},
+        }
+
+    has_maker_fallback = any(str(a.get("mode") or "") == "MAKER" for a in actions)
+
+    return {
+        "mode": "HYBRID_BACK_CS_BUCKET_RECOVERY_PACKAGE_PREVIEW" if has_maker_fallback else "TAKER_BACK_CS_BUCKET_RECOVERY_PACKAGE_PREVIEW",
+        "reason": "safe_hybrid_back_bucket_package_improves_slc_worst" if has_maker_fallback else "safe_taker_back_bucket_package_improves_slc_worst",
+        "actions": actions,
+        "action_count": len(actions),
+        "capital": round(float(capital), 6),
+        "current_worst": round(float(current_worst), 6),
+        "current_best": round(float(current_best), 6),
+        "worst_if_full": round(float(worst_if_full), 6),
+        "best_if_full": round(float(best_if_full), 6),
+        "worst_improvement": round(float(worst_improvement), 6),
+        "worst_buckets": worst_buckets,
+        "target_count": len(target_runners),
+        "priced_count": len(priced),
+        "taker_count": sum(1 for a in actions if str(a.get("mode") or "") == "TAKER"),
+        "maker_fallback_count": sum(1 for a in actions if str(a.get("mode") or "") == "MAKER"),
+        "inv_sum": round(float(inv_sum), 6),
+        "scale": 1.0,  # global_safe_sizing_grid_v1 fixed legacy scale field
+        "profile_if_full": {k: round(float(v), 6) for k, v in trial_profile.items()},
+        "top_actions": actions[:20],
+    }
+
+
 def _second_leg_cs_recovery_preview(
     *,
     markets: dict[str, MarketState] | None,
@@ -6051,9 +6558,30 @@ def _second_leg_cs_recovery_preview(
         }
         return taker_back
 
+    bucket_back = _second_leg_cs_back_bucket_recovery_package_preview(
+        markets=markets,
+        second_leg_combined_profile=second_leg_combined_profile,
+    )
+
+    if str(bucket_back.get("mode") or "") in ("TAKER_BACK_CS_BUCKET_RECOVERY_PACKAGE_PREVIEW", "HYBRID_BACK_CS_BUCKET_RECOVERY_PACKAGE_PREVIEW"):
+        bucket_back["priority"] = "BUCKET_BACK_PACKAGE_AFTER_SINGLE_ACTIONS_FAILED"
+        bucket_back["taker_lay_result"] = {
+            "mode": taker.get("mode"),
+            "reason": taker.get("reason"),
+        }
+        bucket_back["maker_lay_result"] = {
+            "mode": maker.get("mode"),
+            "reason": maker.get("reason"),
+        }
+        bucket_back["taker_back_result"] = {
+            "mode": taker_back.get("mode"),
+            "reason": taker_back.get("reason"),
+        }
+        return bucket_back
+
     return {
         "mode": "NO_CS_RECOVERY",
-        "reason": "no_safe_taker_lay_maker_lay_or_taker_back_cs_candidate",
+        "reason": "no_safe_single_or_bucket_cs_recovery_candidate",
         "actions": [],
         "action_count": 0,
         "taker_lay_result": {
@@ -6067,6 +6595,34 @@ def _second_leg_cs_recovery_preview(
         "taker_back_result": {
             "mode": taker_back.get("mode"),
             "reason": taker_back.get("reason"),
+        },
+        "bucket_back_result": {
+            "mode": bucket_back.get("mode"),
+            "reason": bucket_back.get("reason"),
+            "current_worst": bucket_back.get("current_worst"),
+            "current_best": bucket_back.get("current_best"),
+            "current_profile": bucket_back.get("current_profile"),
+            "worst_buckets": bucket_back.get("worst_buckets"),
+            "target_count": bucket_back.get("target_count"),
+            "priced_count": bucket_back.get("priced_count"),
+            "taker_count": bucket_back.get("taker_count"),
+            "maker_fallback_count": bucket_back.get("maker_fallback_count"),
+            "virtual_row_count": bucket_back.get("virtual_row_count"),
+            "missing": bucket_back.get("missing"),
+            "inv_sum": bucket_back.get("inv_sum"),
+            "capital": bucket_back.get("capital"),
+            "worst_improvement": bucket_back.get("worst_improvement"),
+            "max_capital": bucket_back.get("max_capital"),
+            "max_search_capital": bucket_back.get("max_search_capital"),
+            "probe_count": bucket_back.get("probe_count"),
+            "best_failed_probe": bucket_back.get("best_failed_probe"),
+            "best_failed_capital": bucket_back.get("best_failed_capital"),
+            "best_failed_worst": bucket_back.get("best_failed_worst"),
+            "best_failed_best": bucket_back.get("best_failed_best"),
+            "best_failed_worst_improvement": bucket_back.get("best_failed_worst_improvement"),
+            "best_failed_worst_buckets": bucket_back.get("best_failed_worst_buckets"),
+            "best_failed_probe_profile": bucket_back.get("best_failed_probe_profile"),
+            "best_failed_actions": bucket_back.get("best_failed_actions"),
         },
     }
 
@@ -6536,6 +7092,174 @@ def _second_leg_cs_debug_line(
                     "actions": [trr_action],
                 }
 
+    second_leg_recovery_preview = _second_leg_cs_recovery_preview(
+        markets=markets,
+        second_leg_combined_profile=second_leg_combined_profile,
+    )
+
+    second_leg_recovery_exec: dict[str, object] = {
+        "status": "NONE",
+        "reason": "no_second_leg_recovery_shadow_execution",
+        "actions": [],
+    }
+
+    recovery_mode = str(second_leg_recovery_preview.get("mode") or "")
+    recovery_back_modes = (
+        "TAKER_BACK_CS_RECOVERY_PREVIEW",
+        "TAKER_BACK_CS_BUCKET_RECOVERY_PACKAGE_PREVIEW",
+        "HYBRID_BACK_CS_BUCKET_RECOVERY_PACKAGE_PREVIEW",
+    )
+
+    if recovery_mode in recovery_back_modes:
+        current_slc_worst = float(second_leg_combined_profile.get("worst", worst) or worst)
+        preview_worst_if_full = float(second_leg_recovery_preview.get("worst_if_full", current_slc_worst) or current_slc_worst)
+        preview_worst_improvement = float(second_leg_recovery_preview.get("worst_improvement", 0.0) or 0.0)
+
+        raw_recovery_actions = []
+        for a in list(second_leg_recovery_preview.get("actions") or []):
+            if str(a.get("side") or "").upper() != "BACK":
+                continue
+
+            try:
+                a_price = float(a.get("price") or 0.0)
+                a_stake = float(a.get("stake") or 0.0)
+            except Exception:
+                continue
+
+            if a_price <= 1.0 or a_stake <= SECOND_LEG_CS_BACK_BUCKET_RECOVERY_MIN_ACTION_STAKE:
+                continue
+
+            raw_recovery_actions.append(dict(a))
+
+        recovery_capital = sum(float(a.get("stake", 0.0) or 0.0) for a in raw_recovery_actions)
+        existing_recovery_capital = sum(
+            float(a.get("stake", 0.0) or 0.0)
+            for a in list(state.get("filled_second_leg_actions") or [])
+            if str(a.get("reason") or "").startswith("SHADOW_CS_RECOVERY")
+            or str(a.get("source_mode") or "").endswith("RECOVERY_PACKAGE_PREVIEW")
+            or str(a.get("source_mode") or "") == "TAKER_BACK_CS_RECOVERY_PREVIEW"
+        )
+
+        if not raw_recovery_actions:
+            second_leg_recovery_exec = {
+                "status": "SKIPPED_NO_BACK_ACTIONS",
+                "reason": "recovery_preview_has_no_valid_back_actions",
+                "mode": recovery_mode,
+                "actions": [],
+            }
+        elif preview_worst_improvement <= SECOND_LEG_PREVIEW_WORST_EPS:
+            second_leg_recovery_exec = {
+                "status": "SKIPPED_NO_WORST_IMPROVEMENT",
+                "reason": "recovery_preview_does_not_improve_slc_worst",
+                "mode": recovery_mode,
+                "worst_improvement": round(float(preview_worst_improvement), 6),
+                "actions": raw_recovery_actions,
+            }
+        elif preview_worst_if_full < current_slc_worst - SECOND_LEG_PREVIEW_WORST_EPS:
+            second_leg_recovery_exec = {
+                "status": "SKIPPED_WORSE_PROFILE",
+                "reason": "recovery_preview_would_worsen_slc_worst",
+                "mode": recovery_mode,
+                "current_worst": round(float(current_slc_worst), 6),
+                "worst_if_full": round(float(preview_worst_if_full), 6),
+                "actions": raw_recovery_actions,
+            }
+        elif (
+            existing_recovery_capital + recovery_capital
+            > float(SECOND_LEG_CS_RECOVERY_SHADOW_MAX_TOTAL_CAPITAL) + SECOND_LEG_PREVIEW_WORST_EPS
+        ):
+            second_leg_recovery_exec = {
+                "status": "SKIPPED_RECOVERY_CAP_EXHAUSTED",
+                "reason": "second_leg_recovery_shadow_total_capital_exhausted",
+                "mode": recovery_mode,
+                "capital": round(float(recovery_capital), 6),
+                "existing_recovery_capital": round(float(existing_recovery_capital), 6),
+                "max_total_recovery_capital": round(float(SECOND_LEG_CS_RECOVERY_SHADOW_MAX_TOTAL_CAPITAL), 6),
+                "actions": raw_recovery_actions,
+            }
+        else:
+            new_recovery_actions: list[dict[str, object]] = []
+
+            for raw_action in raw_recovery_actions:
+                seq = int(state.get("filled_second_leg_seq") or 0) + 1
+                state["filled_second_leg_seq"] = seq
+
+                rec_action = dict(raw_action)
+                rec_action["seq"] = seq
+                rec_action["frame"] = frame_i
+                rec_action["pt"] = now_pt
+                rec_action["side"] = "BACK"
+                rec_action["source_mode"] = recovery_mode
+                rec_action["source_reason"] = str(second_leg_recovery_preview.get("reason") or "")
+                rec_action["reason"] = "SHADOW_CS_RECOVERY_BACK_EXECUTED"
+
+                try:
+                    rec_action["price"] = round(float(rec_action.get("price") or 0.0), 6)
+                    rec_action["stake"] = round(float(rec_action.get("stake") or 0.0), 6)
+                    rec_action["queue_ahead"] = round(float(rec_action.get("queue_ahead", 0.0) or 0.0), 6)
+                except Exception:
+                    pass
+
+                new_recovery_actions.append(rec_action)
+
+            filled_second_leg_actions = list(state.get("filled_second_leg_actions") or [])
+            filled_second_leg_actions.extend(new_recovery_actions)
+            state["filled_second_leg_actions"] = filled_second_leg_actions
+
+            second_leg_combined_profile = _second_leg_combined_bucket_profile(
+                markets=markets,
+                outcome_pnls=outcome_pnls,
+                filled_second_leg_actions=filled_second_leg_actions,
+                filled_totals_greenup_actions=filled_totals_greenup_actions,
+                filled_totals_risk_reduction_actions=filled_totals_risk_reduction_actions,
+            )
+
+            second_leg_totals_greenup_preview = _second_leg_totals_greenup_preview(
+                markets=markets,
+                second_leg_combined_profile=second_leg_combined_profile,
+                filled_totals_greenup_actions=filled_totals_greenup_actions,
+                filled_totals_risk_reduction_actions=filled_totals_risk_reduction_actions,
+            )
+
+            second_leg_totals_risk_reduction_preview = _second_leg_totals_risk_reduction_preview(
+                markets=markets,
+                second_leg_combined_profile=second_leg_combined_profile,
+                filled_totals_greenup_actions=filled_totals_greenup_actions,
+                filled_totals_risk_reduction_actions=filled_totals_risk_reduction_actions,
+            )
+
+            second_leg_recovery_after_exec = _second_leg_cs_recovery_preview(
+                markets=markets,
+                second_leg_combined_profile=second_leg_combined_profile,
+            )
+
+            state["epoch"] = int(state.get("epoch") or 0) + 1
+            state["decision_pt"] = now_pt
+            state["place_due_pt"] = now_pt + SECOND_LEG_REBUILD_DELAY_MS
+            state["stale_due_pt"] = now_pt + SECOND_LEG_REBUILD_DELAY_MS + SECOND_LEG_STALE_AFTER_PLACE_MS
+            state["state"] = "WAITING_PLACE_DELAY"
+            state["reason"] = "SECOND_LEG_RECOVERY_REBUILD"
+            package_rebuild_event = True
+
+            reason = str(state["reason"])
+
+            second_leg_recovery_exec = {
+                "status": "EXECUTED_SHADOW",
+                "reason": "second_leg_recovery_back_preview_accepted",
+                "mode": recovery_mode,
+                "capital": round(float(recovery_capital), 6),
+                "existing_recovery_capital_before": round(float(existing_recovery_capital), 6),
+                "max_total_recovery_capital": round(float(SECOND_LEG_CS_RECOVERY_SHADOW_MAX_TOTAL_CAPITAL), 6),
+                "current_worst_before": round(float(current_slc_worst), 6),
+                "worst_if_full_preview": round(float(preview_worst_if_full), 6),
+                "worst_improvement_preview": round(float(preview_worst_improvement), 6),
+                "actions": new_recovery_actions,
+                "preview_before_exec": second_leg_recovery_preview,
+                "preview_after_exec": second_leg_recovery_after_exec,
+            }
+
+            second_leg_recovery_preview = second_leg_recovery_after_exec
+
     fresh_package_preview = _second_leg_candidate_package_preview(
         markets=markets,
         outcome_pnls=outcome_pnls,
@@ -6771,10 +7495,8 @@ def _second_leg_cs_debug_line(
                 "second_leg_combined_profile": second_leg_combined_profile,
                 "second_leg_totals_greenup_preview": second_leg_totals_greenup_preview,
                 "second_leg_totals_risk_reduction_preview": second_leg_totals_risk_reduction_preview,
-                "second_leg_recovery_preview": _second_leg_cs_recovery_preview(
-                    markets=markets,
-                    second_leg_combined_profile=second_leg_combined_profile,
-                ),
+                "second_leg_recovery_preview": second_leg_recovery_preview,
+                "second_leg_recovery_exec": second_leg_recovery_exec,
                 "totals_risk_reduction_exec": totals_risk_reduction_exec,
                 "filled_totals_risk_reduction": _second_leg_compact_totals_risk_reduction_actions(filled_totals_risk_reduction_actions),
                 "totals_greenup_exec": totals_greenup_exec,
