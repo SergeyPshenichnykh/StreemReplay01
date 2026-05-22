@@ -7765,6 +7765,19 @@ def _second_leg_cs_debug_line(
     fill_status_txt = str(shadow_fill.get("status") or "-")
     fill_actions_txt = int(shadow_fill.get("filled_actions") or 0)
     fill_stake_txt = float(shadow_fill.get("filled_stake") or 0.0)
+
+    recmk_pkg = state.get("recovery_package_preview")
+    recmk_actions_txt = 0
+    recmk_capital_txt = 0.0
+    recmk_status_txt = "-"
+    if isinstance(recmk_pkg, dict):
+        recmk_status_txt = "PEND"
+        recmk_actions_txt = int(recmk_pkg.get("action_count") or 0)
+        recmk_capital_txt = float(recmk_pkg.get("capital") or 0.0)
+
+    recmk_fill_status_txt = str(recovery_shadow_fill.get("status") or "-")
+    recmk_fill_actions_txt = int(recovery_shadow_fill.get("filled_actions") or 0)
+    recmk_fill_stake_txt = float(recovery_shadow_fill.get("filled_stake") or 0.0)
     filled_second_leg_stake_txt = sum(
         float(x.get("stake", 0.0) or 0.0)
         for x in list(filled_second_leg_actions or [])
@@ -7829,6 +7842,8 @@ def _second_leg_cs_debug_line(
         f"w={worst:+.2f} cap={max_capital:.0f} "
         f"PKG={pkg_mode}:{pkg_actions} pc={pkg_capital:.2f} wf={pkg_worst_txt} "
         f"sig={pkg_signal_txt} fill={fill_status_txt}:{fill_actions_txt}/{fill_stake_txt:.2f} "
+        f"recmk={recmk_status_txt}:{recmk_actions_txt}/{recmk_capital_txt:.4f} "
+        f"rf={recmk_fill_status_txt}:{recmk_fill_actions_txt}/{recmk_fill_stake_txt:.4f} "
         f"slf={filled_second_leg_count_txt}/{filled_second_leg_stake_txt:.2f} "
         f"SLC={slc_worst_txt}/{slc_best_txt}/d{slc_drop_txt} "
         f"TG={tg_mode_txt}:{tg_actions_txt}/g{tg_greenup_txt}/w{tg_imp_txt} "
