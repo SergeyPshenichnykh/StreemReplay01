@@ -7419,11 +7419,168 @@ def _second_leg_cs_debug_line(
             "active_package_actions": active_package_actions,
         }
 
+    recovery_stale_due = int(state.get("recovery_stale_due_pt") or 0)
+    if recovery_stale_due and now_pt >= recovery_stale_due:
+        state["recovery_package_preview"] = None
+        state["recovery_package_decision_frame"] = None
+        state["recovery_package_decision_pt"] = None
+        state["recovery_stale_due_pt"] = None
+
+    recovery_shadow_fill = _second_leg_shadow_fill_probe(
+        markets=markets,
+        package_preview=state.get("recovery_package_preview"),
+        active=isinstance(state.get("recovery_package_preview"), dict),
+    )
+
+    recovery_maker_fill_exec: dict[str, object] = {
+        "status": "NONE",
+        "reason": "no_recovery_maker_shadow_fill",
+        "actions": [],
+    }
+
     shadow_fill = _second_leg_shadow_fill_probe(
         markets=markets,
         package_preview=package_preview,
         active=str(state.get("state") or "") == "PACKAGE_PLACED_SHADOW",
     )
+
+    if str(recovery_shadow_fill.get("status") or "") in ("PARTIAL_SIGNAL", "FULL_SIGNAL"):
+        new_recovery_maker_filled_actions: list[dict[str, object]] = []
+
+        for fill in list(recovery_shadow_fill.get("fills") or []):
+            try:
+                fill_stake = float(fill.get("fill_size") or 0.0)
+                fill_price = float(fill.get("price") or 0.0)
+            except Exception:
+                continue
+
+            if fill_stake <= 1e-9 or fill_price <= 1.0:
+                continue
+
+            seq = int(state.get("filled_second_leg_seq") or 0) + 1
+            state["filled_second_leg_seq"] = seq
+
+            new_recovery_maker_filled_actions.append(
+                {
+                    "seq": seq,
+                    "frame": frame_i,
+                    "pt": now_pt,
+                    "mode": "MAKER_SIGNAL",
+                    "side": "BACK",
+                    "runner": str(fill.get("runner") or ""),
+                    "price": round(fill_price, 6),
+                    "stake": round(fill_stake, 6),
+                    "reason": "SHADOW_CS_RECOVERY_MAKER_FILL_SIGNAL",
+                    "source_mode": str((state.get("recovery_package_preview") or {}).get("source_mode") or ""),
+                    "source_reason": str((state.get("recovery_package_preview") or {}).get("reason") or ""),
+                    "fill_reason": str(fill.get("fill_reason") or ""),
+                }
+            )
+
+        if new_recovery_maker_filled_actions:
+            current_slc_worst_for_recovery_fill = float(second_leg_combined_profile.get("worst", worst) or worst)
+
+            trial_filled_second_leg_actions = list(state.get("filled_second_leg_actions") or [])
+            trial_filled_second_leg_actions.extend(new_recovery_maker_filled_actions)
+
+            trial_recovery_profile = _second_leg_combined_bucket_profile(
+                markets=markets,
+                outcome_pnls=outcome_pnls,
+                filled_second_leg_actions=trial_filled_second_leg_actions,
+                filled_totals_greenup_actions=filled_totals_greenup_actions,
+                filled_totals_risk_reduction_actions=filled_totals_risk_reduction_actions,
+            )
+
+            trial_recovery_worst = float(trial_recovery_profile.get("worst", current_slc_worst_for_recovery_fill) or current_slc_worst_for_recovery_fill)
+
+            if trial_recovery_worst < current_slc_worst_for_recovery_fill - SECOND_LEG_PREVIEW_WORST_EPS:
+                recovery_maker_fill_exec = {
+                    "status": "SKIPPED_UNSAFE",
+                    "reason": "recovery_maker_fill_would_worsen_slc_worst",
+                    "current_worst": round(float(current_slc_worst_for_recovery_fill), 6),
+                    "trial_worst": round(float(trial_recovery_worst), 6),
+                    "actions": new_recovery_maker_filled_actions,
+                    "shadow_fill": recovery_shadow_fill,
+                }
+
+                state["recovery_package_preview"] = None
+                state["recovery_package_decision_frame"] = None
+                state["recovery_package_decision_pt"] = None
+                state["recovery_stale_due_pt"] = None
+
+            else:
+                filled_second_leg_actions = list(state.get("filled_second_leg_actions") or [])
+                filled_second_leg_actions.extend(new_recovery_maker_filled_actions)
+                state["filled_second_leg_actions"] = filled_second_leg_actions
+
+                state["recovery_package_preview"] = None
+                state["recovery_package_decision_frame"] = None
+                state["recovery_package_decision_pt"] = None
+                state["recovery_stale_due_pt"] = None
+
+                fresh_package_preview = _second_leg_candidate_package_preview(
+                    markets=markets,
+                    outcome_pnls=outcome_pnls,
+                    filled_second_leg_actions=filled_second_leg_actions,
+                    filled_totals_greenup_actions=filled_totals_greenup_actions,
+                    filled_totals_risk_reduction_actions=filled_totals_risk_reduction_actions,
+                )
+
+                state["epoch"] = int(state.get("epoch") or 0) + 1
+                state["decision_pt"] = now_pt
+                state["place_due_pt"] = now_pt + SECOND_LEG_REBUILD_DELAY_MS
+                state["stale_due_pt"] = now_pt + SECOND_LEG_REBUILD_DELAY_MS + SECOND_LEG_STALE_AFTER_PLACE_MS
+                state["state"] = "WAITING_PLACE_DELAY"
+                state["reason"] = "SECOND_LEG_RECOVERY_MAKER_FILL_REBUILD"
+                state["package_preview"] = fresh_package_preview
+                state["package_decision_frame"] = frame_i
+                state["package_decision_pt"] = now_pt
+
+                reason = str(state["reason"])
+                epoch = int(state.get("epoch") or 0)
+                sl_state = str(state.get("state") or "IDLE")
+                package_preview = fresh_package_preview
+
+                filled_totals_greenup_actions = list(state.get("filled_totals_greenup_actions") or [])
+                filled_totals_risk_reduction_actions = list(state.get("filled_totals_risk_reduction_actions") or [])
+
+                second_leg_combined_profile = _second_leg_combined_bucket_profile(
+                    markets=markets,
+                    outcome_pnls=outcome_pnls,
+                    filled_second_leg_actions=filled_second_leg_actions,
+                    filled_totals_greenup_actions=filled_totals_greenup_actions,
+                    filled_totals_risk_reduction_actions=filled_totals_risk_reduction_actions,
+                )
+
+                second_leg_totals_greenup_preview = _second_leg_totals_greenup_preview(
+                    markets=markets,
+                    second_leg_combined_profile=second_leg_combined_profile,
+                    filled_totals_greenup_actions=filled_totals_greenup_actions,
+                    filled_totals_risk_reduction_actions=filled_totals_risk_reduction_actions,
+                )
+
+                second_leg_totals_risk_reduction_preview = _second_leg_totals_risk_reduction_preview(
+                    markets=markets,
+                    second_leg_combined_profile=second_leg_combined_profile,
+                    filled_totals_greenup_actions=filled_totals_greenup_actions,
+                    filled_totals_risk_reduction_actions=filled_totals_risk_reduction_actions,
+                )
+
+                package_signal = {
+                    "signal": "RECOVERY_MAKER_FILL_REBUILD_TRIGGERED",
+                    "reason": "second_leg_recovery_maker_shadow_fill_signal",
+                    "new_filled_actions": new_recovery_maker_filled_actions,
+                    "rebuild_delay_ms": SECOND_LEG_REBUILD_DELAY_MS,
+                }
+
+                recovery_maker_fill_exec = {
+                    "status": "EXECUTED_SHADOW",
+                    "reason": "second_leg_recovery_maker_shadow_fill_signal",
+                    "current_worst_before": round(float(current_slc_worst_for_recovery_fill), 6),
+                    "worst_after": round(float(trial_recovery_worst), 6),
+                    "actions": new_recovery_maker_filled_actions,
+                    "shadow_fill": recovery_shadow_fill,
+                }
 
     if str(shadow_fill.get("status") or "") in ("PARTIAL_SIGNAL", "FULL_SIGNAL"):
         new_filled_actions: list[dict[str, object]] = []
@@ -7526,7 +7683,26 @@ def _second_leg_cs_debug_line(
     epoch = int(state.get("epoch") or 0)
     sl_state = str(state.get("state") or "IDLE")
 
-    compact_log_key = (epoch, sl_state, reason)
+    recovery_log_active = isinstance(state.get("recovery_package_preview"), dict)
+    recovery_log_status = "-"
+    recovery_log_fills = 0
+    try:
+        recovery_log_status = str((recovery_shadow_fill or {}).get("status") or "-")
+        recovery_log_fills = int((recovery_shadow_fill or {}).get("filled_actions") or 0)
+    except Exception:
+        pass
+
+    recovery_log_tick = frame_i if recovery_log_active else None
+
+    compact_log_key = (
+        epoch,
+        sl_state,
+        reason,
+        recovery_log_active,
+        recovery_log_status,
+        recovery_log_fills,
+        recovery_log_tick,
+    )
     if state.get("last_logged_key") != compact_log_key:
         state["last_logged_key"] = compact_log_key
         _second_leg_debug_write_jsonl(
@@ -7552,6 +7728,8 @@ def _second_leg_cs_debug_line(
                 "fresh_package_compact": _second_leg_compact_package(fresh_package_preview),
                 "package_signal": package_signal,
                 "shadow_fill": shadow_fill,
+                "recovery_shadow_fill": recovery_shadow_fill,
+                "recovery_maker_fill_exec": recovery_maker_fill_exec,
                 "filled_second_leg": _second_leg_compact_filled_actions(filled_second_leg_actions),
                 "second_leg_combined_profile": second_leg_combined_profile,
                 "second_leg_totals_greenup_preview": second_leg_totals_greenup_preview,
