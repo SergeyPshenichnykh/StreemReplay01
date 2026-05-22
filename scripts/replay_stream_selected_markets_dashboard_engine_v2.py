@@ -7110,7 +7110,22 @@ def _second_leg_cs_debug_line(
         "HYBRID_BACK_CS_BUCKET_RECOVERY_PACKAGE_PREVIEW",
     )
 
-    if recovery_mode in recovery_back_modes:
+    recovery_exec_active = str(state.get("state") or "") == "PACKAGE_PLACED_SHADOW"
+
+    if recovery_mode in recovery_back_modes and not recovery_exec_active:
+        second_leg_recovery_exec = {
+            "status": "WAITING_PLACE_DELAY",
+            "reason": "recovery_preview_waiting_place_delay",
+            "mode": recovery_mode,
+            "state": str(state.get("state") or ""),
+            "actions": list(second_leg_recovery_preview.get("actions") or []),
+            "action_count": int(second_leg_recovery_preview.get("action_count") or 0),
+            "capital": second_leg_recovery_preview.get("capital"),
+            "worst_if_full": second_leg_recovery_preview.get("worst_if_full"),
+            "worst_improvement": second_leg_recovery_preview.get("worst_improvement"),
+        }
+
+    elif recovery_mode in recovery_back_modes:
         current_slc_worst = float(second_leg_combined_profile.get("worst", worst) or worst)
         preview_worst_if_full = float(second_leg_recovery_preview.get("worst_if_full", current_slc_worst) or current_slc_worst)
         preview_worst_improvement = float(second_leg_recovery_preview.get("worst_improvement", 0.0) or 0.0)
