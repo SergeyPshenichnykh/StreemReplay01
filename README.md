@@ -666,3 +666,60 @@ Expected interpretation:
 - `maker_fill_signal_rows = 0` means no simulated maker recovery fill occurred without a market fill signal.
 - `bad_exec = 0` means no accepted recovery execution worsened SLC.
 - `final_slc_ok = True` means the final combined SLC profile remains green.
+
+
+rows: 918 frames: 608 -> 9868 negative_slc_rows: 49 blocked_rows: 21 pending_maker_recovery_rows: 13 maker_fill_signal_rows: 0 maker_fill_exec_rows: 0 maker_fill_unsafe_rows: 0 bad_exec: 0 final_slc_worst: +64.607217 final_slc_best: +76.307189 final_slc_ok: True
+Такий результат друкував не engine напряму, а summary-скрипт:
+cd ~/projects/StreemReplay01
+
+python scripts/second_leg_debug_summary.py --strict replay/second_leg_debug.jsonl
+Або коротко, бо jsonl там positional optional:
+python scripts/second_leg_debug_summary.py --strict
+Саме scripts/second_leg_debug_summary.py друкує ці поля:
+rows:
+frames:
+negative_slc_rows:
+blocked_rows:
+pending_maker_recovery_rows:
+maker_fill_signal_rows:
+maker_fill_exec_rows:
+maker_fill_unsafe_rows:
+bad_exec:
+final_slc_worst:
+final_slc_best:
+final_slc_ok:
+Це видно в коді summary-скрипта і в його --help. 
+А replay/second_leg_debug.jsonl, який потім аналізувався цим summary-скриптом, створювався ось таким запуском replay engine:
+cd ~/projects/StreemReplay01
+
+rm -f replay/second_leg_debug.jsonl
+rm -f replay/second_leg_full_run.out
+
+python scripts/replay_stream_selected_markets_dashboard_sticky_totals_engine_v2.py \
+  --stable-stream \
+  --stable-page totals \
+  --replay-file replay/football-pro-sample \
+  --discover-targets \
+  --start-minutes-before 10 \
+  --self-check \
+  --no-snapshots-csv \
+  --list-totals-ladder \
+  --totals-sticky \
+  --totals-rows 3 \
+  --ladder-max-rows 31 \
+  --ticks-above 15 \
+  --ticks-below 15 \
+  --col-width 999 \
+  --cs-cols 3 \
+  --cadence-ms 1000 \
+  --delay 0.004 \
+  --balance 1000 \
+  --engine-v2-overlay \
+  --show-queue \
+  --maker-under-lay-grid \
+  --maker-under-lay-grid-match \
+  --second-leg-cs-debug \
+  --second-leg-debug-jsonl replay/second_leg_debug.jsonl \
+  > replay/second_leg_full_run.out 2>&1
+Цей запуск engine саме пише replay/second_leg_debug.jsonl; після нього йде python scripts/second_leg_debug_summary.py --strict replay/second_leg_debug.jsonl
+
