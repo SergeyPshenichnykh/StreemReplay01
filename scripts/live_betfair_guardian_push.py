@@ -438,10 +438,33 @@ def main() -> int:
     ap.add_argument("--host-header", default="localhost")
     ap.add_argument("--out", default="replay/live_guardian_push_summary.json")
     ap.add_argument("--timeout", type=float, default=15.0)
+    ap.add_argument("--allow-in-play-selector", action="store_true")
+    ap.add_argument("--allow-negative-start-window", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
     props = read_properties(Path(args.config))
+
+    cfg_in_play_only = prop_bool(props, "strategy.inPlayOnly", False)
+    cfg_min_minutes = prop_int(props, "strategy.minMinutesBeforeStart", 0)
+    cfg_max_minutes = prop_int(props, "strategy.maxMinutesBeforeStart", 720)
+
+    if cfg_in_play_only and not args.allow_in_play_selector:
+        raise SystemExit(
+            "ERROR: strategy.inPlayOnly=true in config. "
+            "Refusing to select live in-play events unless --allow-in-play-selector is passed."
+        )
+
+    if cfg_min_minutes < 0 and not args.allow_negative_start_window:
+        raise SystemExit(
+            f"ERROR: strategy.minMinutesBeforeStart={cfg_min_minutes} in config. "
+            "Refusing negative start window unless --allow-negative-start-window is passed."
+        )
+
+    print(
+        f"SELECTOR_CONFIG_GUARD inPlayOnly={cfg_in_play_only} "
+        f"minutes={cfg_min_minutes}-{cfg_max_minutes}"
+    )
 
     betangel_base = args.betangel_base_url or prop(props, "betangel.baseUrl", "http://127.0.0.1:9000/api")
 
